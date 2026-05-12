@@ -49,7 +49,7 @@ def session_to_pdf(chat_history: list, charts: dict[str, Any] | None = None) -> 
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 18)
     pdf.set_xy(10, 6)
-    pdf.cell(0, 10, "Data Analysis Agent — Session Export", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 10, _s("Data Analysis Agent -- Session Export"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Helvetica", "", 9)
     pdf.set_xy(10, 18)
     pdf.cell(0, 6, datetime.datetime.now().strftime("Generated %B %d, %Y at %H:%M"))
