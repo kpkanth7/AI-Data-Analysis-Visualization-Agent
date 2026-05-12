@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One-time setup: create database, catalog table, load demo datasets."""
 import os
+import re
 import sys
 import pandas as pd
 from pathlib import Path
@@ -13,6 +14,8 @@ load_dotenv()
 BASE_DB_URL = os.getenv("DATABASE_URL", "postgresql://pradhyumnakasula@localhost:5432/data_analyst")
 PG_ROOT_URL = BASE_DB_URL.rsplit("/", 1)[0] + "/postgres"
 DB_NAME = BASE_DB_URL.rsplit("/", 1)[-1]
+if not re.match(r'^[a-zA-Z0-9_]+$', DB_NAME):
+    raise ValueError(f"Invalid database name: {DB_NAME!r}. Only alphanumeric and underscores allowed.")
 
 
 def create_database():

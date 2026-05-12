@@ -2,6 +2,7 @@ import os
 import re
 import json
 from contextlib import contextmanager
+from functools import lru_cache
 from typing import Any
 
 import pandas as pd
@@ -19,6 +20,7 @@ _BLOCKED = re.compile(
 def get_db_url() -> str:
     return os.getenv("DATABASE_URL", "postgresql://pradhyumnakasula@localhost:5432/data_analyst")
 
+@lru_cache(maxsize=1)
 def get_engine():
     return create_engine(get_db_url(), poolclass=NullPool)
 
@@ -31,15 +33,24 @@ def get_connection():
 def slugify(name: str) -> str:
     name = re.sub(r"\.(csv|xlsx|xls)$", "", name, flags=re.IGNORECASE)
     name = re.sub(r"[^a-zA-Z0-9]+", "_", name)
-    name = name.strip("_").lower()
-    return name[:63]  # PG identifier limit
+    name = name[:63].strip("_").lower()  # strip AFTER truncate
+    if not name:
+        name = "dataset"
+    if name[0].isdigit():
+        name = "t_" + name[:61]
+    return name
 
 def execute_sql(sql: str, params: dict | None = None) -> list[dict]:
-    if _BLOCKED.search(sql.strip()):
+    # Check entire SQL, not just start, to catch comment-prefixed or multi-statement attacks
+    if _BLOCKED.search(sql):
+        raise ValueError("Only SELECT statements are allowed.")
+    # Block semicolons that could indicate multi-statement injection
+    if ";" in sql.strip().rstrip(";"):
         raise ValueError("Only SELECT statements are allowed.")
     with get_connection() as conn:
         result = conn.execute(text(sql), params or {})
         rows = [dict(row._mapping) for row in result.fetchmany(1000)]
+        truncated = len(rows) == 1000
     return rows
 
 def list_datasets_from_db() -> list[dict]:
