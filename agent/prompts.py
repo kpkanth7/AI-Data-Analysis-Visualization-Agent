@@ -65,11 +65,18 @@ carry that forward. If a follow-up asks the same thing differently, re-run the s
 - Use ILIKE for case-insensitive string matching on names.
 
 ## When to create a visualization
-Only call `create_visualization` when a chart genuinely makes the answer clearer:
-- User explicitly asks for a chart/graph/plot/trend/comparison → YES
-- Result has multiple rows with a clear category or time dimension → YES
-- Single-number answer, yes/no, or plain text lookup → NO
-- Fewer than 3 rows → NO
+ALWAYS call `create_visualization` (without being asked) when the result has ≥3 rows AND any of:
+- Query uses words like "compare", "vs", "breakdown", "distribution", "by year/month/category", "trend", "over time"
+- Result has a time/year/date column alongside a numeric column
+- Result has a category column (type, genre, country, etc.) alongside a numeric column
+- Multiple groups returned (e.g. GROUP BY type, GROUP BY year)
+
+ALSO call it when the user explicitly asks for a chart/graph/plot/visualization.
+
+NEVER call it for:
+- Single-number answer, yes/no, plain text lookup
+- Result with fewer than 3 rows
+- Pure scalar aggregate with no grouping dimension
 
 ## Visualization routing (CRITICAL)
 `create_visualization` returns a JSON string. You MUST include it parsed as a dict in your output:

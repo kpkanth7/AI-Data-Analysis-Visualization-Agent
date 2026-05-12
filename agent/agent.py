@@ -120,7 +120,24 @@ def run_agent(
     output_text = result.get("output", "")
     parser = PydanticOutputParser(pydantic_object=AnalysisOutput)
     analysis = _extract_analysis(output_text, parser)
+    if analysis:
+        _coerce_chart_configs(analysis)
     return analysis, accumulator.steps
+
+
+def _coerce_chart_configs(analysis: AnalysisOutput) -> None:
+    """If the LLM embedded chart_config as a JSON string instead of a dict, decode it."""
+    if isinstance(analysis.chart_config, str):
+        try:
+            analysis.chart_config = json.loads(analysis.chart_config)
+        except Exception:
+            analysis.chart_config = None
+    for sub in analysis.sub_results or []:
+        if isinstance(sub.chart_config, str):
+            try:
+                sub.chart_config = json.loads(sub.chart_config)
+            except Exception:
+                sub.chart_config = None
 
 
 def _extract_analysis(output_text: str, parser: PydanticOutputParser) -> AnalysisOutput:
@@ -153,12 +170,21 @@ def _extract_analysis(output_text: str, parser: PydanticOutputParser) -> Analysi
                 except Exception:
                     start = -1
 
-    # 4. Salvage chart_config + strip code fences from prose
+    # 4. Salvage chart_config with proper bracket matching + strip code fences from prose
     chart_config = None
-    m2 = re.search(r'"chart_config"\s*:\s*(\{.*?\})', output_text, re.DOTALL)
+    m2 = re.search(r'"chart_config"\s*:\s*(\{)', output_text)
     if m2:
         try:
-            chart_config = json.loads(m2.group(1))
+            start = m2.start(1)
+            depth = 0
+            for i, c in enumerate(output_text[start:], start):
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        chart_config = json.loads(output_text[start : i + 1])
+                        break
         except Exception:
             pass
     clean = re.sub(r"```.*?```", "", output_text, flags=re.DOTALL).strip()
