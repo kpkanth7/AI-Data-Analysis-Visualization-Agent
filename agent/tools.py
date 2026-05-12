@@ -187,16 +187,19 @@ def detect_trends_tool(table: str, date_col: str, value_col: str, window: int = 
 def create_visualization(
     chart_type: str,
     data: list,
-    x: str,
-    y: str,
     title: str = "",
+    x: str = None,
+    y: str = None,
     color: str = None,
     anomaly_col: str = None,
 ) -> str:
     """
     Create a Plotly chart specification.
     chart_type: line | bar | scatter | histogram | heatmap | pie | anomaly | box
+    x: column name for x-axis (or pie "names" column). Optional for histogram/heatmap.
+    y: column name for y-axis (or pie "values" column). Optional for histogram/heatmap.
     IMPORTANT: The returned JSON string must be included as chart_config in your final output.
+    Only call this when a chart genuinely helps — NOT for single-number answers or simple text lookups.
     """
     config = {
         "chart_type": chart_type,

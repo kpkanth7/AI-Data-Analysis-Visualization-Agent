@@ -67,6 +67,7 @@ def record_query() -> None:
         record_guest_query()
     except Exception:
         st.session_state["_fallback_queries"] = st.session_state.get("_fallback_queries", 0) + 1
+    invalidate_limits_cache()
 
 
 # ── Internal auth ──────────────────────────────────────────────────────────────
@@ -121,6 +122,25 @@ def _render_auth_toggle() -> None:
         st.sidebar.markdown("</div>", unsafe_allow_html=True)
 
 
+def _get_cached_limits() -> dict:
+    """Fetch guest limits once per session; invalidated by record_query/record_upload."""
+    if "guest_session_id" not in st.session_state:
+        return {"queries_remaining": 10, "uploads_remaining": 5, "can_query": True, "can_upload": True}
+    if "_limits_cache" not in st.session_state:
+        try:
+            st.session_state["_limits_cache"] = get_guest_limits()
+        except Exception:
+            st.session_state["_limits_cache"] = {
+                "queries_remaining": 10, "uploads_remaining": 5,
+                "can_query": True, "can_upload": True,
+            }
+    return st.session_state["_limits_cache"]
+
+
+def invalidate_limits_cache() -> None:
+    st.session_state.pop("_limits_cache", None)
+
+
 def _render_role_badge() -> None:
     if is_owner():
         st.sidebar.markdown(
@@ -129,21 +149,17 @@ def _render_role_badge() -> None:
         )
         return
 
-    try:
-        limits = get_guest_limits()
-        q_rem = limits["queries_remaining"]
-        u_rem = limits["uploads_remaining"]
-        color = "#16a34a" if q_rem > 4 else ("#d97706" if q_rem > 1 else "#dc2626")
-        st.sidebar.markdown(
-            f'<div class="role-badge guest-badge" style="border-color:{color}">'
-            f'👤 Guest · {q_rem}/10 queries left today · {u_rem}/5 uploads left'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-        if q_rem == 0:
-            st.sidebar.warning("Daily query limit reached. Resets at midnight UTC.")
-    except Exception:
-        st.sidebar.info("👤 Guest mode")
+    limits = _get_cached_limits()
+    q_rem = limits.get("queries_remaining", 10)
+    color = "#16a34a" if q_rem > 4 else ("#d97706" if q_rem > 1 else "#dc2626")
+    st.sidebar.markdown(
+        f'<div class="role-badge guest-badge" style="border-color:{color}">'
+        f'👤 Guest · {q_rem}/10 queries left today · 5 uploads · 10 MB each'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    if q_rem == 0:
+        st.sidebar.warning("Daily query limit reached. Resets at midnight UTC.")
 
 
 # ── Session controls (owner only) ──────────────────────────────────────────────
@@ -196,19 +212,24 @@ def _render_upload() -> None:
     st.sidebar.markdown("#### 📁 Upload Dataset")
 
     if not owner:
+        # Count active session files (not daily counter — guest can replace files freely)
         try:
-            limits = get_guest_limits()
-            if not limits["can_upload"]:
-                st.sidebar.caption(
-                    f"Upload limit reached ({GUEST_UPLOAD_LIMIT} files/day). Resets at midnight UTC."
-                )
-                return
-            bytes_rem_mb = limits["upload_bytes_remaining"] / 1024 / 1024
-            st.sidebar.caption(
-                f"Up to {GUEST_UPLOAD_LIMIT} files · 10 MB each · {bytes_rem_mb:.0f} MB total remaining today"
-            )
+            active = list_datasets_from_db(include_owner_only=False, session_id=sid)
+            session_files = [d for d in active if not d.get("is_demo") and d.get("session_id") == sid]
+            active_count = len(session_files)
         except Exception:
-            pass
+            active_count = 0
+
+        if active_count >= GUEST_UPLOAD_LIMIT:
+            st.sidebar.caption(
+                f"Session file limit reached ({GUEST_UPLOAD_LIMIT} files). "
+                "Remove a dataset below to upload a new one."
+            )
+            st.sidebar.markdown("---")
+            return
+        st.sidebar.caption(
+            f"{active_count}/{GUEST_UPLOAD_LIMIT} session files · 10 MB each"
+        )
 
     uploaded = st.sidebar.file_uploader(
         "CSV or Excel",
@@ -225,15 +246,6 @@ def _render_upload() -> None:
 
         file_size = uploaded.size if hasattr(uploaded, "size") else len(uploaded.getvalue())
 
-        if not owner:
-            try:
-                limits = get_guest_limits()
-                if file_size + limits["upload_bytes_used"] > 50 * 1024 * 1024:
-                    st.sidebar.error("Daily upload byte quota exceeded.")
-                    return
-            except Exception:
-                pass
-
         with st.sidebar.status(f"Ingesting {uploaded.name}…"):
             try:
                 df = read_uploaded_file(uploaded)
@@ -241,6 +253,7 @@ def _render_upload() -> None:
                 slug = ingest_dataframe(df, uploaded.name, **ingest_kwargs)
                 if not owner:
                     record_guest_upload(file_size)
+                    invalidate_limits_cache()
                 st.sidebar.success(f"✅ `{slug}` — {len(df):,} rows")
             except Exception as e:
                 st.sidebar.error(f"Upload failed: {e}")
@@ -262,21 +275,23 @@ def _render_datasets() -> None:
     demo_ds = [d for d in all_ds if d.get("is_demo")]
     user_ds = [d for d in all_ds if not d.get("is_demo")]
 
+    # ── Session / uploaded datasets first ─────────────────────────────────────
+    section_label = "#### 📂 Your Datasets" if owner else "#### 📂 Session Datasets"
+    st.sidebar.markdown(section_label)
+    if not user_ds:
+        st.sidebar.caption("No datasets uploaded yet.")
+    for ds in user_ds:
+        can_del = owner or ds.get("session_id") == sid
+        _dataset_row(ds, allow_delete=can_del)
+
+    st.sidebar.markdown("---")
+
     # ── Demo datasets ──────────────────────────────────────────────────────────
     st.sidebar.markdown("#### 🗄 Demo Datasets")
     if not demo_ds:
         st.sidebar.caption("No demo datasets loaded.")
     for ds in demo_ds:
-        _dataset_expander(ds, allow_delete=False)
-
-    # ── User datasets ──────────────────────────────────────────────────────────
-    if user_ds or owner:
-        label = "#### 📂 Your Datasets" if owner else "#### 📂 Session Datasets"
-        st.sidebar.markdown(label)
-        if not user_ds:
-            st.sidebar.caption("No datasets uploaded yet.")
-        for ds in user_ds:
-            _dataset_expander(ds, allow_delete=owner or ds.get("session_id") == sid)
+        _dataset_row(ds, allow_delete=False)
 
     # ── Suggested queries (guest) ──────────────────────────────────────────────
     if not owner and demo_ds:
@@ -293,26 +308,40 @@ def _render_datasets() -> None:
             st.sidebar.caption(f"→ *{h}*")
 
 
-def _dataset_expander(ds: dict, allow_delete: bool = False) -> None:
-    is_demo = ds.get("is_demo", False)
-    icon = "★ " if is_demo else ""
+def _dataset_row(ds: dict, allow_delete: bool = False) -> None:
+    """Render a dataset as an expandable row with optional inline 🗑 delete."""
     row_count = ds.get("row_count") or 0
-    with st.sidebar.expander(f"{icon}{ds['name']} · {row_count:,} rows"):
-        st.caption(f"Table: `{ds['slug']}`")
-        cols = ds.get("columns_json") or []
-        if isinstance(cols, str):
-            cols = json.loads(cols)
-        if cols:
-            col_df = pd.DataFrame(cols)
-            st.dataframe(col_df, hide_index=True, use_container_width=True)
-        if allow_delete:
-            if st.button("🗑 Remove dataset", key=f"del_ds_{ds['slug']}", type="secondary"):
+    slug = ds["slug"]
+
+    if allow_delete:
+        # Two columns: expander label | 🗑 button
+        col_exp, col_del = st.sidebar.columns([5, 1])
+        with col_exp:
+            with st.expander(f"{ds['name']} · {row_count:,} rows", expanded=False):
+                _dataset_detail(ds)
+        with col_del:
+            st.markdown("<div style='margin-top:6px'>", unsafe_allow_html=True)
+            if st.button("🗑", key=f"del_ds_{slug}", help=f"Remove {ds['name']}", use_container_width=True):
                 try:
-                    delete_dataset(ds["slug"])
-                    st.success(f"Removed `{ds['slug']}`")
+                    delete_dataset(slug)
+                    invalidate_limits_cache()
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Delete failed: {e}")
+                    st.sidebar.error(f"Delete failed: {e}")
+            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        with st.sidebar.expander(f"★ {ds['name']} · {row_count:,} rows", expanded=False):
+            _dataset_detail(ds)
+
+
+def _dataset_detail(ds: dict) -> None:
+    st.caption(f"Table: `{ds['slug']}`")
+    cols = ds.get("columns_json") or []
+    if isinstance(cols, str):
+        cols = json.loads(cols)
+    if cols:
+        col_df = pd.DataFrame(cols)
+        st.dataframe(col_df, hide_index=True, use_container_width=True)
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────

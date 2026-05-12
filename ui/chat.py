@@ -155,13 +155,18 @@ def _render_steps_expander(steps: list[dict]) -> None:
             st.markdown(f"{icon} `{s['tool']}` ← `{s['input'][:100]}`{hint}")
 
 
-# ── PDF session export button ──────────────────────────────────────────────────
+# ── PDF export (header bar) ────────────────────────────────────────────────────
 
-def _render_pdf_export(chart_store: dict) -> None:
+def _render_pdf_export_button(chart_store: dict) -> None:
     history = st.session_state.get("chat_history", [])
-    if not history:
-        return
-    if st.button("📄 Export session as PDF", key="export_pdf_btn", use_container_width=True):
+    disabled = len(history) == 0
+    if st.button(
+        "📄 Export PDF",
+        key="export_pdf_btn",
+        disabled=disabled,
+        help="Export this session as a structured PDF" if not disabled else "Start a conversation first",
+        use_container_width=True,
+    ):
         with st.spinner("Building PDF…"):
             try:
                 pdf_bytes = session_to_pdf(history, charts=chart_store)
@@ -172,7 +177,6 @@ def _render_pdf_export(chart_store: dict) -> None:
                     file_name=f"session_{ts}.pdf",
                     mime="application/pdf",
                     key=f"dl_pdf_{ts}",
-                    use_container_width=True,
                 )
             except Exception as e:
                 st.error(f"PDF export failed: {e}")
@@ -181,71 +185,73 @@ def _render_pdf_export(chart_store: dict) -> None:
 # ── Main tab renderer ──────────────────────────────────────────────────────────
 
 def render_chat_tab() -> None:
-    # chart_store persists figure objects for PDF export (session-scoped, not serialised)
     if "chart_store" not in st.session_state:
         st.session_state["chart_store"] = {}
     chart_store: dict = st.session_state["chart_store"]
 
-    # ── Re-render full chat history ────────────────────────────────────────────
-    for i, msg in enumerate(st.session_state.get("chat_history", [])):
-        role = msg["role"]
-        with st.chat_message(role, avatar="🧑" if role == "user" else "🤖"):
-            st.markdown(msg["content"])
-            if role == "assistant" and msg.get("analysis"):
-                _render_result(msg["analysis"], msg_key=i, chart_store=chart_store)
-            if role == "assistant" and msg.get("steps"):
-                _render_steps_expander(msg["steps"])
+    # ── Header row: title + PDF export ────────────────────────────────────────
+    hcol, pcol = st.columns([5, 1])
+    hcol.markdown("#### 💬 Ask Your Data")
+    with pcol:
+        _render_pdf_export_button(chart_store)
 
-    # ── PDF export at bottom of history ───────────────────────────────────────
-    if st.session_state.get("chat_history"):
-        _render_pdf_export(chart_store)
+    # ── Scrollable message area ────────────────────────────────────────────────
+    # Fixed-height container keeps the chat input anchored below it at all times.
+    with st.container(height=560, border=False):
+        history = st.session_state.get("chat_history", [])
 
-    # ── Chat input (pinned bottom) ─────────────────────────────────────────────
-    query = st.chat_input(
-        "Ask anything about your data…",
-        key="chat_input",
-        disabled=not can_query(),
-    )
+        # Render persisted messages
+        for i, msg in enumerate(history):
+            role = msg["role"]
+            with st.chat_message(role, avatar="🧑" if role == "user" else "🤖"):
+                st.markdown(msg["content"])
+                if role == "assistant" and msg.get("analysis"):
+                    _render_result(msg["analysis"], msg_key=i, chart_store=chart_store)
+                if role == "assistant" and msg.get("steps"):
+                    _render_steps_expander(msg["steps"])
 
-    if not query:
-        if not can_query():
-            st.info("Daily query limit reached. Resets at midnight UTC.")
-        return
+        # Process any pending query (stored by previous run)
+        pending = st.session_state.pop("_pending_query", None)
+        if pending:
+            with st.chat_message("user", avatar="🧑"):
+                st.markdown(pending)
+            st.session_state["chat_history"].append({"role": "user", "content": pending})
 
+            with st.chat_message("assistant", avatar="🤖"):
+                with st.spinner("Analysing…"):
+                    analysis, steps = run_agent(
+                        query=pending,
+                        chat_history=st.session_state.get("lc_history", []),
+                        is_owner=is_owner(),
+                        session_id=get_session_id(),
+                    )
+
+                if analysis:
+                    st.markdown(analysis.answer)
+                    msg_key = len(st.session_state["chat_history"])
+                    _render_result(analysis, msg_key=msg_key, chart_store=chart_store)
+                    _render_steps_expander(steps)
+
+                    st.session_state["lc_history"].append(HumanMessage(content=pending))
+                    st.session_state["lc_history"].append(AIMessage(content=analysis.answer))
+                    st.session_state["chat_history"].append({
+                        "role": "assistant",
+                        "content": analysis.answer,
+                        "analysis": analysis,
+                        "steps": steps,
+                    })
+                else:
+                    st.error("Agent returned no response. Try again.")
+
+            record_query()
+
+    # ── Chat input — always rendered after the container = always at bottom ────
     if not can_query():
-        st.error("Daily query limit reached. Resets at midnight UTC.")
+        st.info("Daily query limit reached. Resets at midnight UTC.")
         return
 
-    # Render user message immediately
-    with st.chat_message("user", avatar="🧑"):
-        st.markdown(query)
-    st.session_state["chat_history"].append({"role": "user", "content": query})
-
-    # Run agent
-    with st.chat_message("assistant", avatar="🤖"):
-        with st.spinner("Analysing…"):
-            analysis, steps = run_agent(
-                query=query,
-                chat_history=st.session_state.get("lc_history", []),
-                is_owner=is_owner(),
-                session_id=get_session_id(),
-            )
-
-        if analysis:
-            st.markdown(analysis.answer)
-            msg_key = len(st.session_state["chat_history"])
-            _render_result(analysis, msg_key=msg_key, chart_store=chart_store)
-            _render_steps_expander(steps)
-
-            st.session_state["lc_history"].append(HumanMessage(content=query))
-            st.session_state["lc_history"].append(AIMessage(content=analysis.answer))
-            st.session_state["chat_history"].append({
-                "role": "assistant",
-                "content": analysis.answer,
-                "analysis": analysis,
-                "steps": steps,
-            })
-        else:
-            st.error("Agent returned no response. Try again.")
-
-    record_query()
+    query = st.chat_input("Ask anything about your data…", key="chat_input")
+    if query:
+        # Store query and rerun so it's processed inside the container above
+        st.session_state["_pending_query"] = query
+        st.rerun()
