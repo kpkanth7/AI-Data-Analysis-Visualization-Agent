@@ -120,9 +120,9 @@ def _render_result(analysis: AnalysisOutput, msg_key: str, chart_store: dict) ->
         except Exception as e:
             st.warning(f"Chart render failed: {e}")
 
-    # SQL used
+    # SQL used — always show so user can verify every factual claim
     if analysis.sql_used:
-        with st.expander("SQL", expanded=False):
+        with st.expander("🔍 Verify SQL", expanded=False):
             st.code(analysis.sql_used, language="sql")
 
     # Excel export
