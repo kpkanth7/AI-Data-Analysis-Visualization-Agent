@@ -1,0 +1,22 @@
+# Environment
+.env
+.streamlit/secrets.toml
+
+# Vector store data
+chroma_db/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Generated outputs
+charts/
+exports/
+logs/
+
+# OS
+.DS_Store
