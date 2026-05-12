@@ -22,7 +22,7 @@ html, body, [class*="css"] {
 /* ── Main container ───────────────────────────────────────────── */
 .main .block-container {
     padding-top: 1.25rem;
-    padding-bottom: 5rem;   /* room for pinned chat input */
+    padding-bottom: 0.5rem;
     max-width: 1100px;
 }
 
@@ -149,12 +149,22 @@ code {
 /* ── Headings ─────────────────────────────────────────────────── */
 h1, h2, h3, h4 { color: #f1f5f9; letter-spacing: -0.02em; }
 
-/* ── Chat input: keep at bottom, styled ──────────────────────── */
+/* ── Chat input: flush to bottom, no gap ─────────────────────── */
+/* Collapse the sticky footer wrapper's padding */
+[data-testid="stBottom"] {
+    padding-bottom: 0 !important;
+    padding-top: 0 !important;
+}
+[data-testid="stBottom"] > div {
+    padding-bottom: 0 !important;
+}
+/* Style the input itself */
 [data-testid="stChatInput"] {
     border-radius: 14px !important;
     border: 1px solid #334155 !important;
     background: #1e293b !important;
-    box-shadow: 0 2px 20px rgba(0,0,0,0.3) !important;
+    box-shadow: 0 -2px 20px rgba(0,0,0,0.4) !important;
+    margin-bottom: 0 !important;
 }
 [data-testid="stChatInput"] textarea {
     font-family: 'Inter', sans-serif !important;

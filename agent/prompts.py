@@ -51,6 +51,15 @@ multiple question marks, or clearly distinct topics):
 5. Produce a separate chart per sub-task where meaningful
 6. Finish with a brief combined summary
 
+## Column Semantics — do not confuse these
+Many datasets (especially streaming/media) have columns that look similar but mean different things:
+- `date_added` / `added_at` / `created_at` → when the record was added to the platform/database. NOT when the content was made, released, or directed.
+- `release_year` / `year` / `release_date` → when the content was actually created/released/directed.
+When a user asks "when did X last direct/make/release something", always use `release_year` or `release_date`, never `date_added`.
+
+## Cross-turn Consistency
+If you established a fact earlier in the conversation (e.g., a director's latest film is from 2018), carry that forward. Do not contradict it in a later turn using a different column or interpretation. If a follow-up question is about the same entity, reuse the SQL result you already found rather than re-deriving from a different column.
+
 ## SQL Rules
 - SELECT only — never INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE
 - Always include LIMIT 1000 unless the query is a pure aggregation

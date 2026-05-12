@@ -111,7 +111,7 @@ def session_to_pdf(chat_history: list, charts: dict[str, Any] | None = None) -> 
                 if ds:
                     pdf.set_font("Helvetica", "I", 8)
                     pdf.set_text_color(120, 120, 120)
-                    pdf.cell(0, 5, f"Datasets: {', '.join(ds)}",
+                    pdf.cell(0, 5, _s(f"Datasets: {', '.join(ds)}"),
                              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             else:
                 _write_wrapped(pdf, content, max_chars=2000)
@@ -127,12 +127,37 @@ def session_to_pdf(chat_history: list, charts: dict[str, Any] | None = None) -> 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Helvetica (built-in fpdf2 font) only covers latin-1 (ISO 8859-1).
+# Replace every out-of-range character so we never crash on Unicode input.
+_UNICODE_MAP = str.maketrans({
+    "—": "--",   # em dash
+    "–": "-",    # en dash
+    "‘": "'",    # left single quote
+    "’": "'",    # right single quote
+    "“": '"',    # left double quote
+    "”": '"',    # right double quote
+    "…": "...",  # ellipsis
+    "•": "*",    # bullet
+    "’": "'",    # curly apostrophe
+    "·": ".",    # middle dot
+    "−": "-",    # minus sign
+    "×": "x",    # multiplication sign
+})
+
+
+def _s(text: str) -> str:
+    """Sanitise text to latin-1 safe characters for fpdf2 built-in fonts."""
+    text = text.translate(_UNICODE_MAP)
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
 def _truncate(text: str, n: int) -> str:
-    return text if len(text) <= n else text[:n - 1] + "…"
+    text = _s(text)
+    return text if len(text) <= n else text[:n - 1] + "."
 
 
 def _write_wrapped(pdf, text: str, max_chars: int = 1500) -> None:
-    text = text[:max_chars] + ("…" if len(text) > max_chars else "")
+    text = _s(text[:max_chars] + ("..." if len(text) > max_chars else ""))
     pdf.multi_cell(0, 5, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(1)
 
