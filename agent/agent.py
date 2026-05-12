@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import threading
 
@@ -118,9 +119,47 @@ def run_agent(
 
     output_text = result.get("output", "")
     parser = PydanticOutputParser(pydantic_object=AnalysisOutput)
-    try:
-        analysis = parser.parse(output_text)
-    except Exception:
-        analysis = AnalysisOutput(answer=output_text)
-
+    analysis = _extract_analysis(output_text, parser)
     return analysis, accumulator.steps
+
+
+def _extract_analysis(output_text: str, parser: PydanticOutputParser) -> AnalysisOutput:
+    # 1. Direct parse
+    try:
+        return parser.parse(output_text)
+    except Exception:
+        pass
+
+    # 2. JSON from ```json ... ``` block
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", output_text, re.DOTALL)
+    if m:
+        try:
+            return parser.parse(m.group(1))
+        except Exception:
+            pass
+
+    # 3. Outermost { } in text
+    depth, start = 0, -1
+    for i, c in enumerate(output_text):
+        if c == "{":
+            depth += 1
+            if start == -1:
+                start = i
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    return parser.parse(output_text[start : i + 1])
+                except Exception:
+                    start = -1
+
+    # 4. Salvage chart_config + strip code fences from prose
+    chart_config = None
+    m2 = re.search(r'"chart_config"\s*:\s*(\{.*?\})', output_text, re.DOTALL)
+    if m2:
+        try:
+            chart_config = json.loads(m2.group(1))
+        except Exception:
+            pass
+    clean = re.sub(r"```.*?```", "", output_text, flags=re.DOTALL).strip()
+    return AnalysisOutput(answer=clean, chart_config=chart_config)

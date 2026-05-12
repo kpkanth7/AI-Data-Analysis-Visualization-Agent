@@ -6,6 +6,13 @@ from typing import Any
 
 import pandas as pd
 
+try:
+    from fpdf import FPDF, XPos, YPos
+    _FPDF_AVAILABLE = True
+except ImportError:
+    FPDF = XPos = YPos = None
+    _FPDF_AVAILABLE = False
+
 
 # ── PNG chart export ──────────────────────────────────────────────────────────
 
@@ -34,9 +41,7 @@ def session_to_pdf(chat_history: list, charts: dict[str, Any] | None = None) -> 
     chat_history: list of {role, content, analysis?}
     charts: mapping of message index → plotly Figure (optional, for embedding PNGs)
     """
-    try:
-        from fpdf import FPDF, XPos, YPos
-    except ImportError:
+    if not _FPDF_AVAILABLE:
         raise ImportError("fpdf2 required: pip install fpdf2")
 
     pdf = FPDF()
