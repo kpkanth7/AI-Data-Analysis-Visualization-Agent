@@ -30,7 +30,8 @@ def test_list_datasets_empty():
 def test_compute_stats_returns_json():
     mock_df = pd.DataFrame({"revenue": [100.0, 200.0, 300.0]})
     with patch("agent.tools.get_engine") as mock_eng, \
-         patch("agent.tools.pd.read_sql_table", return_value=mock_df):
+         patch("agent.tools.pd.read_sql_table", return_value=mock_df), \
+         patch("agent.tools._accessible_slugs", return_value={"sales"}):
         mock_eng.return_value = MagicMock()
         from agent.tools import compute_stats
         result = compute_stats.invoke({"table": "sales", "column": "revenue", "metrics": ["sum", "avg"]})
@@ -63,12 +64,21 @@ def test_create_visualization_returns_config():
 
 
 def test_save_session_creates_file(tmp_path):
-    import os
-    with patch("agent.tools.os.makedirs"), \
-         patch("builtins.open", create=True) as mock_open:
-        mock_open.return_value.__enter__ = MagicMock()
-        mock_open.return_value.__exit__ = MagicMock(return_value=False)
-        from agent.tools import save_session
-        result = save_session.invoke({"conversation": "test conversation"})
-        parsed = json.loads(result)
-        assert "log_path" in parsed
+    """save_session moved to core/session_manager. Verify it saves a JSON file."""
+    from core.session_manager import save_session
+    history = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi there"},
+    ]
+    import os, pathlib
+    # Redirect SESSIONS_DIR to tmp_path
+    import core.session_manager as sm
+    orig_dir = sm.SESSIONS_DIR
+    sm.SESSIONS_DIR = pathlib.Path(tmp_path)
+    try:
+        path = save_session(history, label="test")
+        assert os.path.exists(path)
+        data = json.loads(open(path).read())
+        assert len(data["messages"]) == 2
+    finally:
+        sm.SESSIONS_DIR = orig_dir

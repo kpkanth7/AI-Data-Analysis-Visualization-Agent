@@ -43,13 +43,24 @@ def infer_and_parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def ingest_dataframe(df: pd.DataFrame, filename: str, is_demo: bool = False) -> str:
+def ingest_dataframe(
+    df: pd.DataFrame,
+    filename: str,
+    is_demo: bool = False,
+    owner_only: bool = False,
+    session_id: str | None = None,
+) -> str:
     df = infer_and_parse_dates(df)
     slug = slugify(filename)
     profile = profile_dataframe(df)
     engine = get_engine()
     df.to_sql(slug, engine, if_exists="replace", index=False)
-    register_dataset(filename, slug, df, profile, is_demo=is_demo)
+    register_dataset(
+        filename, slug, df, profile,
+        is_demo=is_demo,
+        owner_only=owner_only,
+        session_id=session_id,
+    )
     index_dataset_in_chroma(slug, df.columns.tolist(), profile)
     return slug
 

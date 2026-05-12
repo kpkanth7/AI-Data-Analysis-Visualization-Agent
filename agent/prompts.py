@@ -13,10 +13,21 @@ Use `search_metadata_tool` to discover which columns are relevant before writing
 - Outliers / anomalies → `detect_anomalies_tool`
 - Any visual request OR whenever you have tabular results → `create_visualization`
 - User asks to download / export → `export_data`
-- End of response → `save_session`
+
+## CRITICAL: Visualization Routing
+When you call `create_visualization`, it returns a JSON string.
+You MUST include this JSON string (parsed as a dict) in your final output:
+- For a SINGLE question response: set `chart_config` at the top level of the output JSON.
+- For MULTI-subquery responses: set `chart_config` inside the matching `sub_results[i]` object.
+Never omit chart_config when you called create_visualization — the UI will NOT render it otherwise.
+
+## CRITICAL: Data Preview
+After any `query_sql` or `query_pandas` call, include the first 10 rows in `data_preview`
+(top-level for single questions, inside sub_results[i].data_preview for multi-subquery).
+This shows the user a table of results even when no chart is generated.
 
 ## Multi-Subquery Protocol
-If the user's message contains multiple independent requests (signalled by: AND, ALSO, PLUS,
+If the user's message contains multiple independent requests (AND, ALSO, PLUS,
 multiple question marks, or clearly distinct topics):
 1. State: "I'll answer [N] questions:"
 2. Number each sub-task: [1], [2], ...
@@ -43,4 +54,7 @@ multiple question marks, or clearly distinct topics):
 ## Output Format
 Return ONLY valid JSON matching this schema:
 {format_instructions}
+
+IMPORTANT: `chart_config` must be the PARSED dict from create_visualization output, not a string.
+`data_preview` must be a list of row dicts (max 10 rows).
 """

@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -8,45 +9,51 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 
-from agent.tools import ALL_TOOLS
+from agent.tools import ALL_TOOLS, set_session_context
 from agent.prompts import SYSTEM_PROMPT
 from agent.schema import AnalysisOutput
 
 load_dotenv()
 
+# Thread-local storage for step accumulation (safe for concurrent Streamlit sessions)
+_tl = threading.local()
 
-class StreamlitStepHandler(BaseCallbackHandler):
-    """Streams agent tool calls live into a Streamlit st.empty() container."""
 
-    def __init__(self, container):
-        self.container = container
-        self.steps: list[str] = []
+class StepAccumulator(BaseCallbackHandler):
+    """Collects agent tool steps silently; caller renders them after the response."""
+
+    def __init__(self):
+        self.steps: list[dict] = []
 
     def on_tool_start(self, serialized: dict, input_str: str, **kwargs):
-        name = serialized.get("name", "tool")
-        self.steps.append(f"⏳ `{name}` ← {str(input_str)[:120]}")
-        self.container.markdown("\n\n".join(self.steps))
+        self.steps.append({
+            "tool": serialized.get("name", "tool"),
+            "input": str(input_str)[:200],
+            "status": "running",
+            "output_hint": "",
+        })
 
     def on_tool_end(self, output: str, **kwargs):
-        if self.steps:
-            self.steps[-1] = self.steps[-1].replace("⏳", "✅")
-            try:
-                parsed = json.loads(output)
-                if "total_rows" in parsed:
-                    self.steps[-1] += f" → {parsed['total_rows']} rows"
-                elif "anomaly_count" in parsed:
-                    self.steps[-1] += f" → {parsed['anomaly_count']} anomalies"
-                elif "export_path" in parsed:
-                    self.steps[-1] += f" → saved to `{parsed['export_path']}`"
-                elif "log_path" in parsed:
-                    self.steps[-1] += f" → logged"
-            except Exception:
-                pass
-        self.container.markdown("\n\n".join(self.steps))
+        if not self.steps:
+            return
+        self.steps[-1]["status"] = "done"
+        try:
+            parsed = json.loads(output)
+            if "total_rows" in parsed:
+                self.steps[-1]["output_hint"] = f"{parsed['total_rows']} rows"
+            elif "anomaly_count" in parsed:
+                self.steps[-1]["output_hint"] = f"{parsed['anomaly_count']} anomalies"
+            elif "export_path" in parsed:
+                self.steps[-1]["output_hint"] = "exported"
+            elif "log_path" in parsed:
+                self.steps[-1]["output_hint"] = "saved"
+        except Exception:
+            pass
 
-    def on_agent_finish(self, finish, **kwargs):
-        self.steps.append("🏁 Done")
-        self.container.markdown("\n\n".join(self.steps))
+    def on_tool_error(self, error, **kwargs):
+        if self.steps:
+            self.steps[-1]["status"] = "error"
+            self.steps[-1]["output_hint"] = str(error)[:100]
 
 
 def _get_openai_key() -> str:
@@ -91,19 +98,29 @@ def build_agent() -> AgentExecutor:
 def run_agent(
     query: str,
     chat_history: list,
-    step_container,
-) -> AnalysisOutput | None:
+    is_owner: bool = False,
+    session_id: str | None = None,
+) -> tuple[AnalysisOutput | None, list[dict]]:
+    """
+    Returns (AnalysisOutput, steps).
+    steps is a list of {tool, input, status, output_hint} dicts.
+    Caller decides how to display them (collapsed expander).
+    """
+    set_session_context(is_owner=is_owner, session_id=session_id)
+
     executor = build_agent()
-    handler = StreamlitStepHandler(step_container)
+    accumulator = StepAccumulator()
 
     result = executor.invoke(
         {"input": query, "chat_history": chat_history},
-        config={"callbacks": [handler]},
+        config={"callbacks": [accumulator]},
     )
 
     output_text = result.get("output", "")
     parser = PydanticOutputParser(pydantic_object=AnalysisOutput)
     try:
-        return parser.parse(output_text)
+        analysis = parser.parse(output_text)
     except Exception:
-        return AnalysisOutput(answer=output_text)
+        analysis = AnalysisOutput(answer=output_text)
+
+    return analysis, accumulator.steps
