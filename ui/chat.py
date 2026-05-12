@@ -13,21 +13,23 @@ from core.pdf_export import chart_to_png, dataframe_to_csv, session_to_pdf
 
 # ── Export helpers ─────────────────────────────────────────────────────────────
 
-def _csv_download(rows: list[dict], key: str, label: str = "⬇ Download CSV") -> None:
+def _csv_download(rows: list[dict], key: str) -> None:
     if not rows:
         return
     data = dataframe_to_csv(rows)
     st.download_button(
-        label,
+        "⬇ Download CSV",
         data=data,
         file_name=f"data_{key}.csv",
         mime="text/csv",
         key=f"csv_{key}",
         use_container_width=True,
+        type="secondary",
     )
 
 
-def _png_download(fig, key: str) -> None:
+def _png_download(fig, key: str) -> bool:
+    """Returns True if the button was rendered (kaleido available)."""
     try:
         png = chart_to_png(fig)
         st.download_button(
@@ -37,9 +39,34 @@ def _png_download(fig, key: str) -> None:
             mime="image/png",
             key=f"png_{key}",
             use_container_width=True,
+            type="secondary",
         )
+        return True
     except Exception:
-        pass  # kaleido not available — skip silently
+        return False
+
+
+def _render_chart(fig, chart_key: str, chart_store: dict) -> None:
+    """Render a chart with its download button in a clean layout."""
+    chart_store[chart_key] = fig
+    st.plotly_chart(fig, use_container_width=True, key=f"pc_{chart_key}")
+    # Download button flush below chart, small width so it doesn't dominate
+    dl_col, _ = st.columns([1, 3])
+    with dl_col:
+        _png_download(fig, key=chart_key)
+
+
+def _render_table(rows: list[dict], table_key: str) -> None:
+    """Render a dataframe with its download button."""
+    import pandas as pd
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+    dl_col, _ = st.columns([1, 3])
+    with dl_col:
+        _csv_download(rows, key=table_key)
 
 
 # ── Result renderer ────────────────────────────────────────────────────────────
@@ -54,44 +81,34 @@ def _render_result(analysis: AnalysisOutput, msg_key: str, chart_store: dict) ->
                 st.markdown(f"**[{sub.index}] {sub.question}**")
                 st.markdown(sub.answer)
 
-                # Data preview table
                 if sub.data_preview:
-                    import pandas as pd
-                    st.dataframe(
-                        pd.DataFrame(sub.data_preview),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                    _csv_download(sub.data_preview, key=f"{msg_key}_sub{sub.index}")
+                    _render_table(sub.data_preview, table_key=f"{msg_key}_sub{sub.index}")
 
-                # Chart
                 if sub.chart_config:
                     try:
                         fig = build_chart(sub.chart_config)
-                        chart_key = f"sub_{msg_key}_{sub.index}"
-                        chart_store[chart_key] = fig
-                        st.plotly_chart(fig, use_container_width=True, key=f"pc_{chart_key}")
-                        _png_download(fig, key=chart_key)
+                        _render_chart(fig, chart_key=f"sub_{msg_key}_{sub.index}", chart_store=chart_store)
                     except Exception as e:
                         st.warning(f"Chart render failed: {e}")
 
-                # SQL used
                 if sub.sql_used:
                     with st.expander("SQL", expanded=False):
                         st.code(sub.sql_used, language="sql")
 
-                # Excel export
                 if sub.export_path:
                     try:
                         with open(sub.export_path, "rb") as f:
-                            st.download_button(
-                                "⬇ Download Excel",
-                                data=f.read(),
-                                file_name=sub.export_path.split("/")[-1],
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key=f"xl_{msg_key}_sub{sub.index}",
-                                use_container_width=True,
-                            )
+                            dl_col, _ = st.columns([1, 3])
+                            with dl_col:
+                                st.download_button(
+                                    "⬇ Download Excel",
+                                    data=f.read(),
+                                    file_name=sub.export_path.split("/")[-1],
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"xl_{msg_key}_sub{sub.index}",
+                                    use_container_width=True,
+                                    type="secondary",
+                                )
                     except Exception:
                         pass
 
@@ -99,24 +116,13 @@ def _render_result(analysis: AnalysisOutput, msg_key: str, chart_store: dict) ->
 
     # ── Single-question path ───────────────────────────────────────────────────
 
-    # Data preview table
     if analysis.data_preview:
-        import pandas as pd
-        st.dataframe(
-            pd.DataFrame(analysis.data_preview),
-            use_container_width=True,
-            hide_index=True,
-        )
-        _csv_download(analysis.data_preview, key=f"{msg_key}_main")
+        _render_table(analysis.data_preview, table_key=f"{msg_key}_main")
 
-    # Chart
     if analysis.chart_config:
         try:
             fig = build_chart(analysis.chart_config)
-            chart_key = str(msg_key)
-            chart_store[chart_key] = fig
-            st.plotly_chart(fig, use_container_width=True, key=f"pc_{chart_key}")
-            _png_download(fig, key=chart_key)
+            _render_chart(fig, chart_key=str(msg_key), chart_store=chart_store)
         except Exception as e:
             st.warning(f"Chart render failed: {e}")
 
