@@ -1,5 +1,15 @@
-from pydantic import BaseModel, Field
+import json
+from pydantic import BaseModel, Field, field_validator
 from typing import Any, Optional
+
+
+def _coerce_chart(v):
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except Exception:
+            return None
+    return v
 
 
 class SubQueryResult(BaseModel):
@@ -12,13 +22,23 @@ class SubQueryResult(BaseModel):
     export_path: Optional[str] = None
     data_preview: list[dict[str, Any]] = Field(default_factory=list)
 
+    @field_validator("chart_config", mode="before")
+    @classmethod
+    def coerce_chart_config(cls, v):
+        return _coerce_chart(v)
+
 
 class AnalysisOutput(BaseModel):
     answer: str
-    chart_config: Optional[dict[str, Any]] = None  # top-level chart for single-question responses
-    data_preview: list[dict[str, Any]] = Field(default_factory=list)  # top-level table preview
+    chart_config: Optional[dict[str, Any]] = None
+    data_preview: list[dict[str, Any]] = Field(default_factory=list)
     sql_used: Optional[str] = None
     sub_results: list[SubQueryResult] = Field(default_factory=list)
     datasets_used: list[str] = Field(default_factory=list)
     export_path: Optional[str] = None
     queries_used: list[str] = Field(default_factory=list)
+
+    @field_validator("chart_config", mode="before")
+    @classmethod
+    def coerce_chart_config(cls, v):
+        return _coerce_chart(v)

@@ -147,13 +147,21 @@ def _extract_analysis(output_text: str, parser: PydanticOutputParser) -> Analysi
     except Exception:
         pass
 
-    # 2. JSON from ```json ... ``` block
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", output_text, re.DOTALL)
-    if m:
-        try:
-            return parser.parse(m.group(1))
-        except Exception:
-            pass
+    # 2. JSON from ```json ... ``` block — use bracket matching, not regex, for nested objects
+    fence = re.search(r"```(?:json)?\s*(\{)", output_text, re.DOTALL)
+    if fence:
+        start = fence.start(1)
+        depth = 0
+        for i, c in enumerate(output_text[start:], start):
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return parser.parse(output_text[start : i + 1])
+                    except Exception:
+                        break
 
     # 3. Outermost { } in text
     depth, start = 0, -1

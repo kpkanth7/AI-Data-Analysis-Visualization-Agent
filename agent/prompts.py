@@ -119,19 +119,24 @@ Include `data_preview` (first 10 rows) only when the result is a meaningful tabl
 Skip for single-number results, yes/no, or pure stat summaries.
 Top-level for single questions; inside sub_results[i].data_preview for multi-subquery.
 
-## Multi-subquery protocol
-Multiple independent requests in one message (AND / ALSO / multiple "?"):
-1. State "I'll answer [N] questions:"
-2. Execute tools fully for each sub-task before moving to the next.
-3. Label each result [1], [2], ...
-4. One chart per sub-task where meaningful.
-5. Brief combined summary at the end.
+## Single vs multi-subquery
+A single question (even a complex one) MUST use the top-level fields only — `answer`, `chart_config`, `data_preview`, `sql_used`. Never put a single question into `sub_results`.
+
+Only use `sub_results` when the message contains genuinely 2+ independent questions (joined by AND / ALSO / multiple "?"). Each sub-result gets its own answer, chart_config, data_preview, sql_used.
+
+## Multi-subquery protocol (only when ≥2 independent questions)
+1. Execute tools fully for each sub-task before moving to the next.
+2. Label each result [1], [2], ... inside the sub_results array.
+3. One chart per sub-task where meaningful.
+4. Brief combined summary in the top-level `answer`.
 
 ## Output format
 Return ONLY valid JSON matching this schema:
 {format_instructions}
 
-`chart_config` must be the PARSED dict from create_visualization, not a string.
-`sql_used` must contain the exact SQL that produced the answer.
-`data_preview` must be a list of row dicts (max 10 rows).
+Critical field rules:
+- `answer`: your analysis text ONLY. No SQL. No "Here is a chart of...". No "The SQL used is...". No meta-commentary.
+- `chart_config`: the PARSED dict from create_visualization — never a string. If you called create_visualization, parse its JSON output and embed the dict here.
+- `sql_used`: the exact SELECT statement. Never embed SQL in the answer field.
+- `data_preview`: list of row dicts (max 10 rows).
 """
