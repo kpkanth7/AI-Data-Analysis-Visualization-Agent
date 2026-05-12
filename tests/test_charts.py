@@ -43,9 +43,10 @@ def test_anomaly_chart():
     assert len(fig.data) == 2
 
 
-def test_unknown_chart_type_raises():
-    with pytest.raises(ValueError, match="Unknown chart type"):
-        build_chart({"chart_type": "radar", "data": [], "x": "a", "y": "b", "title": ""})
+def test_unknown_chart_type_falls_back_to_bar():
+    # Unknown types fall back to bar rather than crashing the UI
+    fig = build_chart({"chart_type": "radar", "data": [{"a": 1, "b": 2}], "x": "a", "y": "b", "title": ""})
+    assert isinstance(fig, go.Figure)
 
 
 def test_build_chart_accepts_json_string():

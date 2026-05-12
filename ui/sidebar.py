@@ -1,6 +1,5 @@
 """Sidebar: auth toggle, dataset management, session controls."""
 import json
-import uuid
 import streamlit as st
 import pandas as pd
 
@@ -23,16 +22,30 @@ from core.session_manager import save_session, auto_save_if_nonempty
 
 # ── Session state bootstrap ────────────────────────────────────────────────────
 
+def _guest_session_id_from_ip() -> str:
+    """Derive a stable session ID from the client IP so it survives page reloads."""
+    try:
+        from core.rate_limiter import get_ip_hash
+        return get_ip_hash()
+    except Exception:
+        import uuid
+        return str(uuid.uuid4())
+
+
 def init_session_state() -> None:
+    # guest_session_id must be IP-based so uploads persist across reloads.
+    # Set it first (before other defaults) because it depends on network context.
+    if "guest_session_id" not in st.session_state:
+        st.session_state["guest_session_id"] = _guest_session_id_from_ip()
+
     defaults = {
         "is_owner": False,
         "chat_history": [],
         "lc_history": [],
         "active_dataset": None,
-        "guest_session_id": str(uuid.uuid4()),
         "session_label": "",
         "_owner_pw_attempt": "",
-        "_auth_mode": "guest",      # "owner" | "guest"
+        "_auth_mode": "guest",
         "_login_error": "",
     }
     for k, v in defaults.items():

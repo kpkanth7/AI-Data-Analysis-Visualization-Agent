@@ -25,7 +25,8 @@ def build_chart(config: dict | str) -> go.Figure:
 
     builders = {
         "line": lambda: _line(df, x, y, title, color),
-        "bar": lambda: _bar(df, x, y, title, color),
+        "bar": lambda: _bar(df, x, y, title, color, barmode="group"),
+        "stacked_bar": lambda: _bar(df, x, y, title, color, barmode="stack"),
         "scatter": lambda: _scatter(df, x, y, title, color),
         "histogram": lambda: _histogram(df, x, title),
         "heatmap": lambda: _heatmap(df, title),
@@ -35,7 +36,8 @@ def build_chart(config: dict | str) -> go.Figure:
     }
 
     if chart_type not in builders:
-        raise ValueError(f"Unknown chart type: {chart_type}. Valid: {list(builders.keys())}")
+        # Graceful fallback: unknown type → bar
+        return _bar(df, x, y, title, color, barmode="group")
 
     return builders[chart_type]()
 
@@ -59,11 +61,12 @@ def _line(df, x, y, title, color=None):
     return _common_layout(fig, title)
 
 
-def _bar(df, x, y, title, color=None):
-    barmode = "group" if color else "relative"
+def _bar(df, x, y, title, color=None, barmode="group"):
     fig = px.bar(df, x=x, y=y, color=color, title=title, template=TEMPLATE,
                  barmode=barmode, text_auto=".2s")
-    fig.update_traces(textposition="outside")
+    # Text outside only makes sense for non-stacked charts
+    if barmode != "stack":
+        fig.update_traces(textposition="outside")
     return _common_layout(fig, title)
 
 

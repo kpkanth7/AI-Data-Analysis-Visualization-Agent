@@ -195,9 +195,12 @@ def create_visualization(
 ) -> str:
     """
     Create a Plotly chart specification.
-    chart_type: line | bar | scatter | histogram | heatmap | pie | anomaly | box
-    x: column name for x-axis (or pie "names" column). Optional for histogram/heatmap.
-    y: column name for y-axis (or pie "values" column). Optional for histogram/heatmap.
+    chart_type: line | bar | stacked_bar | scatter | histogram | heatmap | pie | anomaly | box
+    x: column for x-axis (or pie names column). Optional for histogram/heatmap.
+    y: column for y-axis (or pie values column). Optional for histogram/heatmap.
+    color: grouping column for bar/stacked_bar/line (creates grouped or stacked series).
+    stacked_bar: use when showing how parts compose a whole across categories or time (requires color=).
+    bar with color=: use for side-by-side grouped comparison across two dimensions.
     IMPORTANT: The returned JSON string must be included as chart_config in your final output.
     Only call this when a chart genuinely helps — NOT for single-number answers or simple text lookups.
     """

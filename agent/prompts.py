@@ -57,14 +57,25 @@ multiple question marks, or clearly distinct topics):
 - Use exact table slugs from `list_datasets`
 - PostgreSQL dialect only
 
-## Chart Selection
-- Time series data → line
-- Category comparison → bar
-- Distributions → histogram
-- Relationships between two numeric cols → scatter
-- Cross-tab or correlation matrix → heatmap
-- Part-of-whole percentages → pie
-- Anomaly results → anomaly (scatter with red outliers)
+## Chart Selection — decide fresh for EVERY query, never inherit from prior turns
+For each new query pick the chart type independently based solely on what the data and question need.
+Ignore what chart type was used in earlier conversation turns — past context does not determine present choice.
+
+Rules:
+- Time series (date/time on x-axis) → line
+- Single-dimension category counts or totals → bar  (x=category, y=metric)
+- Two-dimension comparison (category × category, or category × time) → bar with color= grouping column
+- Stacked part-of-whole across categories/time → stacked_bar with color= grouping column
+- Numeric distribution (spread of one column) → histogram
+- Relationship / correlation between two numerics → scatter
+- Full correlation matrix → heatmap
+- Anomaly detection results → anomaly
+- Part-of-whole proportions with ≤5 categories and no time axis → pie
+
+CRITICAL pie chart rules:
+- Use pie ONLY when: there is exactly one grouping column, ≤5 categories, and the question is about proportions/shares.
+- NEVER use pie for: time-series data, comparisons across years/periods, counts where bar is clearer, or when there are >5 categories.
+- "Movies vs TV shows" or "X vs Y" comparisons → use bar (with color if split by time/another dimension), NOT pie.
 
 ## Output Format
 Return ONLY valid JSON matching this schema:

@@ -3,19 +3,23 @@ import streamlit as st
 import pandas as pd
 from db.postgres import list_datasets_from_db, get_engine
 from core.exporter import export_to_excel
+from ui.sidebar import is_owner, get_session_id
 
 
 def render_explorer_tab():
     st.header("🔍 Data Explorer")
 
     try:
-        datasets = list_datasets_from_db()
+        datasets = list_datasets_from_db(
+            include_owner_only=is_owner(),
+            session_id=get_session_id(),
+        )
     except Exception as e:
         st.error(f"Could not load datasets: {e}")
         return
 
     if not datasets:
-        st.info("No datasets loaded. Upload a CSV from the sidebar (owner only).")
+        st.info("No datasets loaded yet. Upload a CSV or Excel file from the sidebar.")
         return
 
     slugs = [d["slug"] for d in datasets]
