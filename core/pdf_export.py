@@ -1,5 +1,6 @@
 """Export utilities: PNG chart, CSV dataframe, and full-session PDF."""
 import io
+import re
 import csv
 import datetime
 from typing import Any
@@ -14,14 +15,11 @@ except ImportError:
     _FPDF_AVAILABLE = False
 
 
-# ── PNG chart export ──────────────────────────────────────────────────────────
+# ── PNG / CSV exports ─────────────────────────────────────────────────────────
 
 def chart_to_png(fig) -> bytes:
-    """Convert a Plotly figure to PNG bytes using kaleido."""
     return fig.to_image(format="png", width=1000, height=500, scale=2)
 
-
-# ── CSV dataframe export ──────────────────────────────────────────────────────
 
 def dataframe_to_csv(rows: list[dict]) -> bytes:
     if not rows:
@@ -33,176 +31,298 @@ def dataframe_to_csv(rows: list[dict]) -> bytes:
     return output.getvalue().encode("utf-8")
 
 
-# ── Full session PDF export ───────────────────────────────────────────────────
+# ── Unicode sanitizer ─────────────────────────────────────────────────────────
 
-def session_to_pdf(chat_history: list, charts: dict[str, Any] | None = None) -> bytes:
-    """
-    Build a structured PDF of the session.
-    chat_history: list of {role, content, analysis?}
-    charts: mapping of message index → plotly Figure (optional, for embedding PNGs)
-    """
-    if not _FPDF_AVAILABLE:
-        raise ImportError("fpdf2 required: pip install fpdf2")
-
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    # ── Header ────────────────────────────────────────────────────────────────
-    pdf.set_fill_color(15, 23, 42)        # dark navy
-    pdf.rect(0, 0, 210, 28, style="F")
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.set_xy(10, 6)
-    pdf.cell(0, 10, _s("Data Analysis Agent -- Session Export"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_xy(10, 18)
-    pdf.cell(0, 6, datetime.datetime.now().strftime("Generated %B %d, %Y at %H:%M"))
-    pdf.ln(14)
-
-    pdf.set_text_color(30, 30, 30)
-
-    msg_idx = 0
-    for msg in chat_history:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-
-        if role == "user":
-            # ── Question bubble ───────────────────────────────────────────────
-            pdf.set_fill_color(224, 242, 254)   # light blue
-            pdf.set_draw_color(59, 130, 246)
-            pdf.set_font("Helvetica", "B", 10)
-            pdf.set_text_color(30, 64, 175)
-            pdf.cell(0, 7, f"Q{msg_idx + 1}  {_truncate(content, 120)}",
-                     fill=True, border="L", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.ln(2)
-
-        elif role == "assistant":
-            pdf.set_font("Helvetica", "", 10)
-            pdf.set_text_color(30, 30, 30)
-
-            analysis = msg.get("analysis")
-            if analysis:
-                # Answer text
-                answer = getattr(analysis, "answer", "") or content
-                _write_wrapped(pdf, answer, max_chars=2000)
-
-                # Data preview table
-                preview = getattr(analysis, "data_preview", []) or []
-                if preview:
-                    _write_table(pdf, preview[:10])
-
-                # Sub-results
-                for sub in (getattr(analysis, "sub_results", []) or []):
-                    pdf.set_font("Helvetica", "B", 10)
-                    pdf.set_text_color(80, 80, 80)
-                    pdf.cell(0, 6, f"[{sub.index}] {_truncate(sub.question, 100)}",
-                             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-                    pdf.set_font("Helvetica", "", 10)
-                    pdf.set_text_color(30, 30, 30)
-                    _write_wrapped(pdf, sub.answer or "", max_chars=1000)
-                    if sub.data_preview:
-                        _write_table(pdf, sub.data_preview[:8])
-                    # Embed chart image if available
-                    if charts and f"sub_{msg_idx}_{sub.index}" in charts:
-                        _embed_chart(pdf, charts[f"sub_{msg_idx}_{sub.index}"])
-
-                # Top-level chart
-                if charts and str(msg_idx) in charts:
-                    _embed_chart(pdf, charts[str(msg_idx)])
-
-                # Datasets used
-                ds = getattr(analysis, "datasets_used", []) or []
-                if ds:
-                    pdf.set_font("Helvetica", "I", 8)
-                    pdf.set_text_color(120, 120, 120)
-                    pdf.cell(0, 5, _s(f"Datasets: {', '.join(ds)}"),
-                             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            else:
-                _write_wrapped(pdf, content, max_chars=2000)
-
-            pdf.ln(4)
-            pdf.set_draw_color(220, 220, 220)
-            pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-            pdf.ln(4)
-            msg_idx += 1
-
-    return bytes(pdf.output())
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-# Helvetica (built-in fpdf2 font) only covers latin-1 (ISO 8859-1).
-# Replace every out-of-range character so we never crash on Unicode input.
 _UNICODE_MAP = str.maketrans({
-    "—": "--",   # em dash
-    "–": "-",    # en dash
-    "‘": "'",    # left single quote
-    "’": "'",    # right single quote
-    "“": '"',    # left double quote
-    "”": '"',    # right double quote
-    "…": "...",  # ellipsis
-    "•": "*",    # bullet
-    "’": "'",    # curly apostrophe
-    "·": ".",    # middle dot
-    "−": "-",    # minus sign
-    "×": "x",    # multiplication sign
+    "—": "--", "–": "-",
+    "‘": "'",  "’": "'",
+    "“": '"',  "”": '"',
+    "…": "...",
+    "•": "-",
+    "·": ".",
+    "−": "-",
+    "×": "x",
 })
+
+_FILLER_RE = re.compile(
+    r"^\s*(?:"
+    r"here(?:'s| is) (?:the |a )?(?:visualization|chart|graph|plot|data|table|sql|query|result|output)"
+    r"|the sql used(?:\s+for\s+this)?(?:\s+(?:data|query))?\s*(?:is|:)"
+    r"|i(?:'ll| will) answer \d+ questions?"
+    r")\s*[:\.]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _s(text: str) -> str:
-    """Sanitise text to latin-1 safe characters for fpdf2 built-in fonts."""
-    text = text.translate(_UNICODE_MAP)
+    text = str(text).translate(_UNICODE_MAP)
     return text.encode("latin-1", errors="replace").decode("latin-1")
 
 
 def _truncate(text: str, n: int) -> str:
-    text = _s(text)
-    return text if len(text) <= n else text[:n - 1] + "."
+    text = _s(str(text))
+    return text if len(text) <= n else text[: n - 1] + "."
 
 
-def _write_wrapped(pdf, text: str, max_chars: int = 1500) -> None:
+def _clean_answer(text: str, max_chars: int = 3000) -> str:
+    """Strip filler lines and collapse excess blank lines."""
     text = _s(text[:max_chars] + ("..." if len(text) > max_chars else ""))
-    pdf.multi_cell(0, 5, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    lines = text.split("\n")
+    kept, blank_run = [], 0
+    for line in lines:
+        stripped = line.strip()
+        if _FILLER_RE.match(stripped):
+            continue
+        if stripped == "":
+            blank_run += 1
+            if blank_run <= 1:
+                kept.append("")
+        else:
+            blank_run = 0
+            kept.append(line)
+    return "\n".join(kept).strip()
+
+
+# ── Full session PDF ──────────────────────────────────────────────────────────
+
+def session_to_pdf(chat_history: list, charts: dict[str, Any] | None = None) -> bytes:
+    if not _FPDF_AVAILABLE:
+        raise ImportError("fpdf2 required: pip install fpdf2")
+
+    pdf = FPDF(unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_margins(15, 15, 15)
+    pdf.add_page()
+
+    _draw_header(pdf)
+
+    q_num = 0
+    for actual_idx, msg in enumerate(chat_history):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        if role == "user":
+            q_num += 1
+            _draw_question(pdf, q_num, content)
+
+        elif role == "assistant":
+            analysis = msg.get("analysis")
+            if analysis:
+                _draw_analysis(pdf, analysis, actual_idx, charts)
+            else:
+                _draw_answer_body(pdf, content)
+            _draw_divider(pdf)
+
+    return bytes(pdf.output())
+
+
+# ── Section renderers ─────────────────────────────────────────────────────────
+
+def _draw_header(pdf: "FPDF") -> None:
+    pdf.set_fill_color(15, 23, 42)
+    pdf.rect(0, 0, 210, 34, style="F")
+    pdf.set_font("Helvetica", "B", 19)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_xy(15, 8)
+    pdf.cell(0, 10, _s("Data Analysis Session Report"))
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(148, 172, 209)
+    pdf.set_xy(15, 21)
+    pdf.cell(0, 6, _s(datetime.datetime.now().strftime("Generated %B %d, %Y at %H:%M")))
+    pdf.set_text_color(30, 30, 30)
+    pdf.ln(24)
+
+
+def _draw_question(pdf: "FPDF", num: int, text: str) -> None:
+    x0, y0 = pdf.get_x(), pdf.get_y()
+    pdf.set_fill_color(239, 246, 255)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(30, 64, 175)
+    pdf.multi_cell(
+        0, 7,
+        _s(f"   Q{num}   {_truncate(text, 150)}"),
+        fill=True,
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT,
+    )
+    y1 = pdf.get_y()
+    pdf.set_fill_color(59, 130, 246)
+    pdf.rect(x0, y0, 3, y1 - y0, style="F")
+    pdf.set_text_color(30, 30, 30)
+    pdf.ln(4)
+
+
+def _draw_analysis(pdf: "FPDF", analysis, actual_idx: int, charts) -> None:
+    if getattr(analysis, "sub_results", None):
+        for sub in analysis.sub_results:
+            _section_label(pdf, f"[{sub.index}] {_truncate(sub.question or '', 100)}")
+            _draw_answer_body(pdf, sub.answer or "")
+            if sub.data_preview:
+                _section_label(pdf, "Data")
+                _write_table(pdf, sub.data_preview[:10])
+            if getattr(sub, "sql_used", None):
+                _draw_sql_block(pdf, sub.sql_used)
+            chart_key = f"sub_{actual_idx}_{sub.index}"
+            if charts and chart_key in charts:
+                _section_label(pdf, "Visualization")
+                _embed_chart(pdf, charts[chart_key])
+        return
+
+    # Single-question path
+    answer = _clean_answer(getattr(analysis, "answer", "") or "")
+    if answer:
+        _draw_answer_body(pdf, answer)
+
+    preview = getattr(analysis, "data_preview", None) or []
+    if preview:
+        _section_label(pdf, "Data")
+        _write_table(pdf, preview[:10])
+
+    sql = getattr(analysis, "sql_used", "") or ""
+    if sql:
+        _draw_sql_block(pdf, sql)
+
+    if charts and str(actual_idx) in charts:
+        _section_label(pdf, "Visualization")
+        _embed_chart(pdf, charts[str(actual_idx)])
+
+    ds = getattr(analysis, "datasets_used", []) or []
+    if ds:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(148, 163, 184)
+        pdf.cell(0, 5, _s(f"Source: {', '.join(ds)}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_text_color(30, 30, 30)
+        pdf.ln(1)
+
+
+def _section_label(pdf: "FPDF", label: str) -> None:
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(100, 116, 139)
+    pdf.cell(0, 5, _s(label.upper()), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_text_color(30, 30, 30)
     pdf.ln(1)
 
 
-def _write_table(pdf, rows: list[dict]) -> None:
-    if not rows:
-        return
-    cols = list(rows[0].keys())
-    col_w = min(35, max(15, 170 // max(len(cols), 1)))
-    visible_cols = cols[:min(len(cols), 170 // col_w)]
+def _draw_divider(pdf: "FPDF") -> None:
+    pdf.ln(3)
+    pdf.set_draw_color(226, 232, 240)
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+    pdf.ln(6)
 
-    # Header row
-    pdf.set_fill_color(243, 244, 246)
-    pdf.set_font("Helvetica", "B", 7)
-    pdf.set_text_color(50, 50, 50)
-    for c in visible_cols:
-        pdf.cell(col_w, 5, _truncate(str(c), col_w // 2 + 2), border=1, fill=True)
-    pdf.ln()
 
-    # Data rows
-    pdf.set_font("Helvetica", "", 7)
+def _draw_sql_block(pdf: "FPDF", sql: str) -> None:
+    _section_label(pdf, "SQL")
+    pdf.set_fill_color(248, 250, 252)
+    pdf.set_draw_color(203, 213, 225)
+    pdf.set_font("Courier", "", 8)
+    pdf.set_text_color(51, 65, 85)
+    sql_clean = _s(sql.strip()[:2000])
+    pdf.multi_cell(
+        0, 4.5, sql_clean,
+        border=1, fill=True,
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT,
+    )
     pdf.set_text_color(30, 30, 30)
-    for row in rows:
-        for c in visible_cols:
-            val = str(row.get(c, ""))
-            pdf.cell(col_w, 5, _truncate(val, col_w // 2 + 2), border=1)
-        pdf.ln()
+    pdf.ln(4)
+
+
+# ── Answer text with inline bold / bullet parsing ─────────────────────────────
+
+def _draw_answer_body(pdf: "FPDF", text: str) -> None:
+    """Render markdown-lite: **bold**, - bullets, numbered items."""
+    cleaned = _clean_answer(text)
+    for line in cleaned.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            pdf.ln(2)
+            continue
+        _write_inline(pdf, stripped)
     pdf.ln(2)
 
 
-def _embed_chart(pdf, fig) -> None:
+def _write_inline(pdf: "FPDF", line: str) -> None:
+    """Write one line with optional bold segments and bullet prefix."""
+    # Bullet
+    is_bullet = bool(re.match(r"^[-*]\s+", line))
+    if is_bullet:
+        line = re.sub(r"^[-*]\s+", "", line).strip()
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(100, 116, 139)
+        pdf.write(5, "  - ")
+        pdf.set_text_color(30, 30, 30)
+
+    # Numbered list stays as-is (handled below)
+    segments = re.split(r"\*\*(.+?)\*\*", line)
+
+    if len(segments) == 1:
+        # No bold — use multi_cell for proper word wrap
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(30, 30, 30)
+        if is_bullet:
+            # Already used write() for bullet prefix; continue inline
+            pdf.write(5, _s(line))
+            pdf.ln(5)
+        else:
+            pdf.multi_cell(0, 5, _s(line), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    else:
+        # Inline bold via write()
+        pdf.set_text_color(30, 30, 30)
+        for i, seg in enumerate(segments):
+            if not seg:
+                continue
+            pdf.set_font("Helvetica", "B" if i % 2 == 1 else "", 10)
+            pdf.write(5, _s(seg))
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "", 10)
+
+
+# ── Table ─────────────────────────────────────────────────────────────────────
+
+def _write_table(pdf: "FPDF", rows: list[dict]) -> None:
+    if not rows:
+        return
+    cols = list(rows[0].keys())
+    col_w = min(45, max(18, 180 // max(len(cols), 1)))
+    visible_cols = cols[: min(len(cols), 180 // col_w)]
+
+    # Header row
+    pdf.set_fill_color(30, 64, 175)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(255, 255, 255)
+    for c in visible_cols:
+        pdf.cell(col_w, 7, _truncate(str(c), col_w // 2 + 4), fill=True, align="C")
+    pdf.ln()
+
+    # Data rows — alternating fill
+    pdf.set_font("Helvetica", "", 8)
+    for r_i, row in enumerate(rows):
+        pdf.set_fill_color(248, 250, 252 if r_i % 2 == 0 else 255, 255)
+        # fix: alternate between two close grays
+        if r_i % 2 == 0:
+            pdf.set_fill_color(248, 250, 252)
+        else:
+            pdf.set_fill_color(255, 255, 255)
+        pdf.set_text_color(30, 30, 30)
+        for c in visible_cols:
+            val = str(row.get(c, ""))
+            pdf.cell(col_w, 6, _truncate(val, col_w // 2 + 4), fill=True)
+        pdf.ln()
+
+    # Bottom rule
+    pdf.set_draw_color(203, 213, 225)
+    x0 = pdf.get_x()
+    pdf.line(x0, pdf.get_y(), x0 + col_w * len(visible_cols), pdf.get_y())
+    pdf.ln(5)
+
+
+# ── Chart embed ───────────────────────────────────────────────────────────────
+
+def _embed_chart(pdf: "FPDF", fig) -> None:
     try:
         png = chart_to_png(fig)
         buf = io.BytesIO(png)
-        x = pdf.get_x()
-        y = pdf.get_y()
-        if y > 240:
+        if pdf.get_y() > 230:
             pdf.add_page()
-            y = pdf.get_y()
-        pdf.image(buf, x=10, y=y, w=180)
-        pdf.ln(95)
+        pdf.image(buf, x=15, y=pdf.get_y(), w=180)
+        pdf.ln(97)
     except Exception:
         pass
