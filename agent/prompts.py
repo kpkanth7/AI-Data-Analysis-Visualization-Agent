@@ -22,9 +22,10 @@ Never fabricate an answer by treating an unrelated question as if it were about 
 
 ## Mandatory steps every turn
 1. Call `list_datasets` to know available tables and their columns.
-2. **Check relevance before proceeding.** After seeing the available datasets, ask: "Could any of these tables plausibly answer this question?" If NO — the query is about a topic (e.g. weather, sports scores, stock prices, general knowledge) that has no column or row match in any dataset — stop immediately and respond:
+2. **Relevance check (internal reasoning — never output this step's wording).** Silently evaluate whether any loaded table could plausibly answer the user's question. If NONE can — the topic (e.g. weather, sports scores, general knowledge) has no column or row match in any dataset — stop and put ONLY this in the `answer` field:
    "Your question about [topic] isn't related to the available datasets ([list dataset names]). Please ask something about the data you've loaded."
-   Do NOT call any further tools. Do NOT guess which table might be close enough.
+   Do NOT echo internal checklist phrases like "Could any of these tables..." into the answer. Do NOT call any further tools. Do NOT guess which table might be close enough.
+   For multi-part questions, run this check per part — proceed with the relevant parts even if one part is unrelated.
 3. Only if relevant: Call `search_metadata_tool` to find the exact column names relevant to the question.
 4. Run `query_sql` (or the appropriate tool) to fetch the actual data.
 5. Answer only from what those results contain.
@@ -89,6 +90,9 @@ The bar is: *would a chart make this faster to understand than reading a table?*
 - Multi-subquery → `sub_results[i].chart_config`
 Never omit chart_config after calling create_visualization — the UI won't render it otherwise.
 
+## User preference is the highest priority
+If the user explicitly names a chart type ("pie chart", "line graph", "bar chart", "scatter plot", "histogram", "heatmap", "box plot", "stacked bar"), USE THAT TYPE even if it isn't the statistically ideal pick. Adapt the data to fit (e.g. aggregate to ≤8 slices for a requested pie). Only push back if the request is genuinely impossible (e.g. pie chart of a 200-row time series — explain in `answer` and pick the closest sensible alternative).
+
 ## Chart type selection — decide fresh every turn, never inherit from prior context
 Pick chart type solely from the current data and question. Ignore what was used before.
 
@@ -139,4 +143,61 @@ Critical field rules:
 - `chart_config`: the PARSED dict from create_visualization — never a string. If you called create_visualization, parse its JSON output and embed the dict here.
 - `sql_used`: the exact SELECT statement. Never embed SQL in the answer field.
 - `data_preview`: list of row dicts (max 10 rows).
+"""
+
+DECOMPOSE_PROMPT = """\
+Split this user query into independent sub-questions if it contains multiple distinct data analysis questions.
+
+Rules:
+- Set is_multi=true ONLY when there are 2 or more genuinely independent questions — different data dimensions, \
+different analysis intents, or different entities.
+- Each question in the output must be self-contained (include all context: column names, years, names, ranges).
+- A single query with multiple conditions (WHERE x AND y) or multiple columns is NOT multi — do not split it.
+- "also", "and also", "as well as", "additionally" joining DIFFERENT analysis intents → split.
+- "also" joining conditions of the SAME analysis → do not split.
+
+Examples that ARE multi (split):
+  "Show movies vs tv shows by count for 2014-2018 and also plot director X's films by year"
+  → ["Show movies vs tv shows by count for years 2014 to 2018", \
+"Plot the number of films directed by director X by year as a bar chart"]
+
+  "What is the top genre? And what are the top 5 directors by number of titles?"
+  → ["What is the top genre by number of titles?", \
+"Who are the top 5 directors by number of titles?"]
+
+Examples that are NOT multi (do not split):
+  "Show movies from 2014-2018 where rating > 8 and genre is Drama" → single question
+  "What are the top 10 movies by rating with their directors?" → single question
+
+User query: {query}
+"""
+
+FOLLOWUP_PROMPT = """\
+Determine if the current query is a follow-up modification or extension of one of the previous sub-questions.
+
+Previous sub-questions answered in the last turn:
+{sub_q_list}
+
+Current query: {query}
+
+A follow-up is when the user wants to:
+- Add or change a visualization for a previous result \
+("also plot it", "show as bar chart", "visualize that", "could you also plot the X bit")
+- Modify how a previous result is displayed ("use a line chart instead", "show the trend")
+- Get more detail on a specific previous result
+- Complete or retry an incomplete or failed previous result \
+("finish that", "the second question didn't work", "try X again")
+
+NOT a follow-up (genuinely new question, set is_followup=false):
+- A question about entirely different data or entities not mentioned in previous sub-questions
+- A question that could stand fully alone with no reference to prior results
+
+If is_followup=true:
+- target_index: 1-based index of the matching previous sub-question (1 = first, 2 = second, etc.)
+- rewritten_query: a complete, self-contained version of what the user wants — combine current query intent \
+with the full context of the matched sub-question (include original filters, column names, date ranges, etc.)
+
+If is_followup=false:
+- target_index: -1
+- rewritten_query: the original query unchanged
 """
