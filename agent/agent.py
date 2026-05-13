@@ -130,29 +130,65 @@ def run_agent(
     chat_history: list,
     is_owner: bool = False,
     session_id: str | None = None,
-) -> tuple[AnalysisOutput | None, list[dict]]:
+    last_sub_questions: list[str] | None = None,
+) -> tuple[AnalysisOutput | None, list[dict], list[str]]:
     """
-    Returns (AnalysisOutput, steps).
-    steps is a list of {tool, input, status, output_hint} dicts.
-    Caller decides how to display them (collapsed expander).
+    Returns (analysis, steps, used_sub_questions).
+
+    used_sub_questions: list of sub-question strings dispatched this turn.
+      - Empty list for single-question queries and follow-ups.
+      - Non-empty list for multi-question queries (caller stores for follow-up detection).
     """
     set_session_context(is_owner=is_owner, session_id=session_id)
 
-    executor = build_agent()
-    accumulator = StepAccumulator()
+    # ── Follow-up detection ────────────────────────────────────────────────────
+    followup = detect_followup(query, last_sub_questions or [])
+    if followup.is_followup:
+        sub_result, steps = run_sub_agent(
+            followup.rewritten_query,
+            followup.target_index,
+            chat_history,
+            is_owner,
+            session_id,
+        )
+        merged = AnalysisOutput(
+            answer=f"Follow-up on sub-question {followup.target_index}.",
+            sub_results=[sub_result],
+        )
+        return merged, steps, []
 
-    result = executor.invoke(
-        {"input": query, "chat_history": chat_history},
-        config={"callbacks": [accumulator]},
+    # ── Decompose ──────────────────────────────────────────────────────────────
+    sub_questions = decompose_query(query)
+
+    # ── Single-question path ───────────────────────────────────────────────────
+    if len(sub_questions) == 1:
+        executor = build_agent()
+        accumulator = StepAccumulator()
+        result = executor.invoke(
+            {"input": sub_questions[0], "chat_history": chat_history},
+            config={"callbacks": [accumulator]},
+        )
+        output_text = result.get("output", "")
+        parser = PydanticOutputParser(pydantic_object=AnalysisOutput)
+        analysis = _extract_analysis(output_text, parser)
+        if analysis:
+            _coerce_chart_configs(analysis)
+            _auto_visualize_single(analysis, sub_questions[0])
+        return analysis, accumulator.steps, []
+
+    # ── Multi-question path ────────────────────────────────────────────────────
+    all_steps: list[dict] = []
+    sub_results: list[SubQueryResult] = []
+    for i, sub_q in enumerate(sub_questions, start=1):
+        sub_result, steps = run_sub_agent(sub_q, i, chat_history, is_owner, session_id)
+        sub_results.append(sub_result)
+        all_steps.extend(steps)
+
+    merged = AnalysisOutput(
+        answer=f"Answered {len(sub_results)} questions independently.",
+        sub_results=sub_results,
     )
-
-    output_text = result.get("output", "")
-    parser = PydanticOutputParser(pydantic_object=AnalysisOutput)
-    analysis = _extract_analysis(output_text, parser)
-    if analysis:
-        _coerce_chart_configs(analysis)
-        _auto_visualize(analysis, user_query=query)
-    return analysis, accumulator.steps
+    return merged, all_steps, sub_questions
 
 
 _CHART_KEYWORDS = [
