@@ -42,3 +42,14 @@ class AnalysisOutput(BaseModel):
     @classmethod
     def coerce_chart_config(cls, v):
         return _coerce_chart(v)
+
+
+class DecomposedQuestions(BaseModel):
+    questions: list[str]
+    is_multi: bool
+
+
+class FollowUpResult(BaseModel):
+    is_followup: bool
+    target_index: int   # 1-based index into last_sub_questions; -1 if not a follow-up
+    rewritten_query: str  # self-contained query combining follow-up intent + original context
