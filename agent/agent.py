@@ -179,35 +179,6 @@ def _detect_chart_preference(query: str) -> str | None:
     return None
 
 
-_CLAUSE_SPLIT_RE = re.compile(
-    r"\b(?:and also|also|as well as|additionally|plus,|then)\b|[?.;]\s+",
-    re.IGNORECASE,
-)
-
-
-def _split_clauses(query: str) -> list[str]:
-    """Split a multi-part query into clauses. Each clause is a candidate sub-question."""
-    if not query:
-        return []
-    parts = [p.strip() for p in _CLAUSE_SPLIT_RE.split(query) if p and p.strip()]
-    return parts or [query]
-
-
-def _clause_for_subquery(sub_question: str, clauses: list[str]) -> str | None:
-    """Pick the clause that best matches a sub-question by token overlap."""
-    if not sub_question or not clauses:
-        return None
-    sub_tokens = set(re.findall(r"[a-z0-9]+", sub_question.lower()))
-    if not sub_tokens:
-        return None
-    best, best_score = None, 0
-    for c in clauses:
-        c_tokens = set(re.findall(r"[a-z0-9]+", c.lower()))
-        score = len(sub_tokens & c_tokens)
-        if score > best_score:
-            best, best_score = c, score
-    return best if best_score >= 2 else None
-
 
 def _infer_chart_config(rows: list[dict], forced_type: str | None = None) -> dict | None:
     """Infer chart_type/x/y from row shape. Return None if not chartable."""
@@ -271,37 +242,67 @@ def _infer_chart_config(rows: list[dict], forced_type: str | None = None) -> dic
     return None
 
 
-def _auto_visualize(analysis: AnalysisOutput, user_query: str = "") -> None:
-    """Build chart_config from data_preview when agent omitted it OR user requested a specific type.
-    For multi-subquery results, chart preference is detected per-clause and only applied
-    to the sub-result whose question matches that clause."""
-    def _apply(rows, existing, pref):
-        if pref:
-            if existing and isinstance(existing, dict):
-                cfg = dict(existing)
-                cfg["chart_type"] = pref
-                if not cfg.get("data") and rows:
-                    cfg["data"] = rows[:500]
-                return cfg
-            return _infer_chart_config(rows or [], forced_type=pref)
-        if not existing and rows:
-            return _infer_chart_config(rows)
-        return existing
+def _auto_visualize_single(analysis: AnalysisOutput, sub_question: str) -> None:
+    """Apply chart preference from sub_question text and fill in missing chart_config.
 
-    if analysis.sub_results:
-        clauses = _split_clauses(user_query)
-        for sub in analysis.sub_results:
-            clause = _clause_for_subquery(sub.question or "", clauses)
-            sub_pref = _detect_chart_preference(clause) if clause else None
-            new_cfg = _apply(sub.data_preview, sub.chart_config, sub_pref)
-            if new_cfg:
-                sub.chart_config = new_cfg
-        return
+    Precedence:
+    1. Agent produced chart_config + user specified type → override type only, keep rest
+    2. Agent produced chart_config, no user pref → keep as-is
+    3. User specified type, no agent chart → infer from data with forced type
+    4. No pref, no chart, data present → auto-infer from data shape
+    5. No data → nothing
+    """
+    pref = _detect_chart_preference(sub_question)
+    existing = analysis.chart_config
+    rows = analysis.data_preview
 
-    pref = _detect_chart_preference(user_query)
-    new_cfg = _apply(analysis.data_preview, analysis.chart_config, pref)
-    if new_cfg:
-        analysis.chart_config = new_cfg
+    if pref:
+        if existing and isinstance(existing, dict):
+            cfg = dict(existing)
+            cfg["chart_type"] = pref
+            if not cfg.get("data") and rows:
+                cfg["data"] = rows[:500]
+            analysis.chart_config = cfg
+        else:
+            analysis.chart_config = _infer_chart_config(rows or [], forced_type=pref)
+    elif not existing and rows:
+        analysis.chart_config = _infer_chart_config(rows)
+
+
+def run_sub_agent(
+    sub_question: str,
+    index: int,
+    lc_history: list,
+    is_owner: bool,
+    session_id: str | None,
+) -> tuple[SubQueryResult, list[dict]]:
+    """Run one independent agent invocation for a single sub-question."""
+    set_session_context(is_owner=is_owner, session_id=session_id)
+    executor = build_agent()
+    accumulator = StepAccumulator()
+
+    result = executor.invoke(
+        {"input": sub_question, "chat_history": lc_history},
+        config={"callbacks": [accumulator]},
+    )
+
+    output_text = result.get("output", "")
+    parser = PydanticOutputParser(pydantic_object=AnalysisOutput)
+    analysis = _extract_analysis(output_text, parser)
+
+    if analysis:
+        _coerce_chart_configs(analysis)
+        _auto_visualize_single(analysis, sub_question)
+
+    return SubQueryResult(
+        index=index,
+        question=sub_question,
+        answer=analysis.answer if analysis else "No answer returned for this sub-question.",
+        chart_config=analysis.chart_config if analysis else None,
+        data_preview=analysis.data_preview if analysis else [],
+        sql_used=analysis.sql_used if analysis else None,
+        export_path=analysis.export_path if analysis else None,
+    ), accumulator.steps
 
 
 def _coerce_chart_configs(analysis: AnalysisOutput) -> None:
