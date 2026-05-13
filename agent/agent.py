@@ -11,8 +11,8 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 
 from agent.tools import ALL_TOOLS, set_session_context
-from agent.prompts import SYSTEM_PROMPT
-from agent.schema import AnalysisOutput
+from agent.prompts import SYSTEM_PROMPT, DECOMPOSE_PROMPT, FOLLOWUP_PROMPT
+from agent.schema import AnalysisOutput, SubQueryResult, DecomposedQuestions, FollowUpResult
 
 load_dotenv()
 
@@ -96,6 +96,35 @@ def build_agent() -> AgentExecutor:
     )
 
 
+def decompose_query(query: str) -> list[str]:
+    """Split multi-question query into independent sub-questions via LLM. Returns [query] if single."""
+    try:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=_get_openai_key())
+        structured = llm.with_structured_output(DecomposedQuestions)
+        result = structured.invoke(DECOMPOSE_PROMPT.format(query=query))
+        if result.is_multi and len(result.questions) >= 2:
+            return result.questions
+    except Exception:
+        pass
+    return [query]
+
+
+def detect_followup(query: str, last_sub_questions: list[str]) -> FollowUpResult:
+    """Detect if query is a follow-up to a specific previous sub-question."""
+    if not last_sub_questions:
+        return FollowUpResult(is_followup=False, target_index=-1, rewritten_query=query)
+    try:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=_get_openai_key())
+        structured = llm.with_structured_output(FollowUpResult)
+        sub_q_list = "\n".join(f"[{i + 1}] {q}" for i, q in enumerate(last_sub_questions))
+        result = structured.invoke(FOLLOWUP_PROMPT.format(sub_q_list=sub_q_list, query=query))
+        if result.is_followup and not (1 <= result.target_index <= len(last_sub_questions)):
+            return FollowUpResult(is_followup=False, target_index=-1, rewritten_query=query)
+        return result
+    except Exception:
+        return FollowUpResult(is_followup=False, target_index=-1, rewritten_query=query)
+
+
 def run_agent(
     query: str,
     chat_history: list,
@@ -122,7 +151,157 @@ def run_agent(
     analysis = _extract_analysis(output_text, parser)
     if analysis:
         _coerce_chart_configs(analysis)
+        _auto_visualize(analysis, user_query=query)
     return analysis, accumulator.steps
+
+
+_CHART_KEYWORDS = [
+    ("stacked_bar", ["stacked bar", "stacked-bar", "stack bar"]),
+    ("pie", ["pie chart", "pie graph", "donut", "as a pie", "pie of"]),
+    ("line", ["line chart", "line graph", "as a line", "line plot", "trend line"]),
+    ("scatter", ["scatter plot", "scatter chart", "scatterplot"]),
+    ("histogram", ["histogram", "distribution plot"]),
+    ("heatmap", ["heatmap", "heat map", "correlation matrix"]),
+    ("box", ["box plot", "boxplot", "box-and-whisker"]),
+    ("bar", ["bar chart", "bar graph", "as a bar", "bar plot"]),
+]
+
+
+def _detect_chart_preference(query: str) -> str | None:
+    """Extract explicit chart-type request from text. None if none."""
+    if not query:
+        return None
+    q = query.lower()
+    for ctype, keywords in _CHART_KEYWORDS:
+        for kw in keywords:
+            if kw in q:
+                return ctype
+    return None
+
+
+_CLAUSE_SPLIT_RE = re.compile(
+    r"\b(?:and also|also|as well as|additionally|plus,|then)\b|[?.;]\s+",
+    re.IGNORECASE,
+)
+
+
+def _split_clauses(query: str) -> list[str]:
+    """Split a multi-part query into clauses. Each clause is a candidate sub-question."""
+    if not query:
+        return []
+    parts = [p.strip() for p in _CLAUSE_SPLIT_RE.split(query) if p and p.strip()]
+    return parts or [query]
+
+
+def _clause_for_subquery(sub_question: str, clauses: list[str]) -> str | None:
+    """Pick the clause that best matches a sub-question by token overlap."""
+    if not sub_question or not clauses:
+        return None
+    sub_tokens = set(re.findall(r"[a-z0-9]+", sub_question.lower()))
+    if not sub_tokens:
+        return None
+    best, best_score = None, 0
+    for c in clauses:
+        c_tokens = set(re.findall(r"[a-z0-9]+", c.lower()))
+        score = len(sub_tokens & c_tokens)
+        if score > best_score:
+            best, best_score = c, score
+    return best if best_score >= 2 else None
+
+
+def _infer_chart_config(rows: list[dict], forced_type: str | None = None) -> dict | None:
+    """Infer chart_type/x/y from row shape. Return None if not chartable."""
+    if not rows or len(rows) < 2:
+        return None
+    cols = list(rows[0].keys())
+    if len(cols) < 2:
+        return None
+
+    def is_num(v):
+        if isinstance(v, bool):
+            return False
+        if isinstance(v, (int, float)):
+            return True
+        try:
+            float(str(v).replace(",", ""))
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    numeric_cols, cat_cols, date_cols = [], [], []
+    for c in cols:
+        vals = [r.get(c) for r in rows if r.get(c) is not None]
+        if not vals:
+            continue
+        name_l = c.lower()
+        if any(k in name_l for k in ("date", "year", "month", "time", "_at", "day")):
+            date_cols.append(c)
+        elif sum(is_num(v) for v in vals) / len(vals) >= 0.8:
+            numeric_cols.append(c)
+        else:
+            cat_cols.append(c)
+
+    if not numeric_cols:
+        return None
+
+    y = numeric_cols[0]
+    x_default = date_cols[0] if date_cols else (cat_cols[0] if cat_cols else (numeric_cols[1] if len(numeric_cols) >= 2 else None))
+
+    if forced_type:
+        cfg = {"chart_type": forced_type, "data": rows[:500], "y": y, "title": ""}
+        if forced_type == "histogram":
+            cfg["x"] = y
+        elif forced_type == "heatmap":
+            pass
+        elif forced_type == "scatter" and len(numeric_cols) >= 2:
+            cfg["x"], cfg["y"] = numeric_cols[0], numeric_cols[1]
+        else:
+            cfg["x"] = x_default
+        return cfg
+
+    if date_cols:
+        return {"chart_type": "line", "data": rows[:500], "x": date_cols[0], "y": y, "title": ""}
+    if cat_cols:
+        x = cat_cols[0]
+        if len(rows) <= 5 and len(numeric_cols) == 1 and len(cat_cols) == 1:
+            return {"chart_type": "pie", "data": rows[:500], "x": x, "y": y, "title": ""}
+        return {"chart_type": "bar", "data": rows[:500], "x": x, "y": y, "title": ""}
+    if len(numeric_cols) >= 2:
+        return {"chart_type": "scatter", "data": rows[:500], "x": numeric_cols[0], "y": numeric_cols[1], "title": ""}
+    return None
+
+
+def _auto_visualize(analysis: AnalysisOutput, user_query: str = "") -> None:
+    """Build chart_config from data_preview when agent omitted it OR user requested a specific type.
+    For multi-subquery results, chart preference is detected per-clause and only applied
+    to the sub-result whose question matches that clause."""
+    def _apply(rows, existing, pref):
+        if pref:
+            if existing and isinstance(existing, dict):
+                cfg = dict(existing)
+                cfg["chart_type"] = pref
+                if not cfg.get("data") and rows:
+                    cfg["data"] = rows[:500]
+                return cfg
+            return _infer_chart_config(rows or [], forced_type=pref)
+        if not existing and rows:
+            return _infer_chart_config(rows)
+        return existing
+
+    if analysis.sub_results:
+        clauses = _split_clauses(user_query)
+        for sub in analysis.sub_results:
+            clause = _clause_for_subquery(sub.question or "", clauses)
+            sub_pref = _detect_chart_preference(clause) if clause else None
+            new_cfg = _apply(sub.data_preview, sub.chart_config, sub_pref)
+            if new_cfg:
+                sub.chart_config = new_cfg
+        return
+
+    pref = _detect_chart_preference(user_query)
+    new_cfg = _apply(analysis.data_preview, analysis.chart_config, pref)
+    if new_cfg:
+        analysis.chart_config = new_cfg
 
 
 def _coerce_chart_configs(analysis: AnalysisOutput) -> None:
