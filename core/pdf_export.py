@@ -64,14 +64,33 @@ def _truncate(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1] + "."
 
 
+_JSON_ARTIFACT_RE = re.compile(
+    r'^\s*[\[{].*|"(answer|chart_config|sql_used|data_preview|sub_results)"\s*:',
+    re.DOTALL,
+)
+
+
 def _clean_answer(text: str, max_chars: int = 3000) -> str:
-    """Strip filler lines and collapse excess blank lines."""
+    """Strip filler lines, JSON artifacts, and collapse excess blank lines."""
+    if not text:
+        return ""
+    # If text looks like raw JSON output (starts with { or [), bail out early
+    stripped_start = text.lstrip()
+    if stripped_start.startswith("{") or stripped_start.startswith("["):
+        return "[Structured response — see chart/table above]"
     text = _s(text[:max_chars] + ("..." if len(text) > max_chars else ""))
     lines = text.split("\n")
     kept, blank_run = [], 0
     for line in lines:
         stripped = line.strip()
+        # Drop filler lines
         if _FILLER_RE.match(stripped):
+            continue
+        # Drop lines that look like JSON field declarations
+        if re.match(r'^\s*"[a-z_]+"\s*:', stripped):
+            continue
+        # Drop lines that are pure JSON syntax artifacts
+        if stripped in ("{", "}", "[", "]", "},", "],"):
             continue
         if stripped == "":
             blank_run += 1
@@ -134,10 +153,11 @@ def _draw_header(pdf: "FPDF") -> None:
 
 
 def _draw_question(pdf: "FPDF", num: int, text: str) -> None:
+    page_before = pdf.page_no()
     x0, y0 = pdf.get_x(), pdf.get_y()
-    pdf.set_fill_color(239, 246, 255)
+    pdf.set_fill_color(241, 245, 249)
     pdf.set_font("Helvetica", "B", 10)
-    pdf.set_text_color(30, 64, 175)
+    pdf.set_text_color(30, 41, 59)
     pdf.multi_cell(
         0, 7,
         _s(f"   Q{num}   {_truncate(text, 150)}"),
@@ -145,26 +165,59 @@ def _draw_question(pdf: "FPDF", num: int, text: str) -> None:
         new_x=XPos.LMARGIN, new_y=YPos.NEXT,
     )
     y1 = pdf.get_y()
-    pdf.set_fill_color(59, 130, 246)
-    pdf.rect(x0, y0, 3, y1 - y0, style="F")
+    if pdf.page_no() == page_before:
+        pdf.set_fill_color(71, 85, 105)
+        pdf.rect(x0, y0, 2.5, y1 - y0, style="F")
     pdf.set_text_color(30, 30, 30)
     pdf.ln(4)
+
+
+def _draw_sub_result_card(pdf: "FPDF", sub, actual_idx: int, charts) -> None:
+    """Render one sub-result as a structured card: accent header → answer → table → chart."""
+    # Accent header bar
+    pdf.set_fill_color(30, 64, 175)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(255, 255, 255)
+    label = _s(f"  [{sub.index}]  {_truncate(sub.question or '', 120)}")
+    pdf.multi_cell(
+        180, 7, label,
+        fill=True,
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT,
+    )
+    pdf.set_text_color(30, 30, 30)
+    pdf.ln(3)
+
+    # Answer
+    answer = _clean_answer(sub.answer or "")
+    if answer:
+        _draw_answer_body(pdf, answer)
+
+    # Data table
+    if sub.data_preview:
+        _section_label(pdf, "Records")
+        _write_table(pdf, sub.data_preview[:10])
+
+    # SQL
+    if getattr(sub, "sql_used", None):
+        _draw_sql_block(pdf, sub.sql_used)
+
+    # Chart
+    chart_key = f"sub_{actual_idx}_{sub.index}"
+    if charts and chart_key in charts:
+        _section_label(pdf, "Visualization")
+        _embed_chart(pdf, charts[chart_key])
+
+    # Card bottom rule
+    pdf.ln(2)
+    pdf.set_draw_color(203, 213, 225)
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+    pdf.ln(6)
 
 
 def _draw_analysis(pdf: "FPDF", analysis, actual_idx: int, charts) -> None:
     if getattr(analysis, "sub_results", None):
         for sub in analysis.sub_results:
-            _section_label(pdf, f"[{sub.index}] {_truncate(sub.question or '', 100)}")
-            _draw_answer_body(pdf, sub.answer or "")
-            if sub.data_preview:
-                _section_label(pdf, "Data")
-                _write_table(pdf, sub.data_preview[:10])
-            if getattr(sub, "sql_used", None):
-                _draw_sql_block(pdf, sub.sql_used)
-            chart_key = f"sub_{actual_idx}_{sub.index}"
-            if charts and chart_key in charts:
-                _section_label(pdf, "Visualization")
-                _embed_chart(pdf, charts[chart_key])
+            _draw_sub_result_card(pdf, sub, actual_idx, charts)
         return
 
     # Single-question path
@@ -285,7 +338,7 @@ def _write_table(pdf: "FPDF", rows: list[dict]) -> None:
     visible_cols = cols[: min(len(cols), 180 // col_w)]
 
     # Header row
-    pdf.set_fill_color(30, 64, 175)
+    pdf.set_fill_color(51, 65, 85)
     pdf.set_font("Helvetica", "B", 8)
     pdf.set_text_color(255, 255, 255)
     for c in visible_cols:
@@ -295,8 +348,6 @@ def _write_table(pdf: "FPDF", rows: list[dict]) -> None:
     # Data rows — alternating fill
     pdf.set_font("Helvetica", "", 8)
     for r_i, row in enumerate(rows):
-        pdf.set_fill_color(248, 250, 252 if r_i % 2 == 0 else 255, 255)
-        # fix: alternate between two close grays
         if r_i % 2 == 0:
             pdf.set_fill_color(248, 250, 252)
         else:
@@ -320,9 +371,11 @@ def _embed_chart(pdf: "FPDF", fig) -> None:
     try:
         png = chart_to_png(fig)
         buf = io.BytesIO(png)
-        if pdf.get_y() > 230:
+        chart_h = 90
+        page_h = pdf.h - pdf.b_margin
+        if pdf.get_y() + chart_h + 4 > page_h:
             pdf.add_page()
-        pdf.image(buf, x=15, y=pdf.get_y(), w=180)
-        pdf.ln(97)
+        pdf.image(buf, x=15, y=pdf.get_y(), w=180, h=chart_h)
+        pdf.ln(chart_h + 3)
     except Exception:
         pass
