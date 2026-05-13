@@ -22,21 +22,21 @@ from core.session_manager import save_session, auto_save_if_nonempty
 
 # ── Session state bootstrap ────────────────────────────────────────────────────
 
-def _guest_session_id_from_ip() -> str:
-    """Derive a stable session ID from the client IP so it survives page reloads."""
-    try:
-        from core.rate_limiter import get_ip_hash
-        return get_ip_hash()
-    except Exception:
-        import uuid
-        return str(uuid.uuid4())
+def _new_guest_session_id() -> str:
+    """Browser fingerprint = hash(IP + User-Agent + Accept-Language).
+    - Refresh same browser → same id → datasets persist for 24h
+    - Friend opens shared URL on different network/browser → different id → fresh page
+    - URL carries no identifier → not shareable
+    Rate limiting still uses IP-only hash."""
+    from core.rate_limiter import get_browser_fingerprint
+    return get_browser_fingerprint()
 
 
 def init_session_state() -> None:
     # guest_session_id must be IP-based so uploads persist across reloads.
     # Set it first (before other defaults) because it depends on network context.
     if "guest_session_id" not in st.session_state:
-        st.session_state["guest_session_id"] = _guest_session_id_from_ip()
+        st.session_state["guest_session_id"] = _new_guest_session_id()
 
     defaults = {
         "is_owner": False,
@@ -175,6 +175,17 @@ def _render_role_badge() -> None:
         st.sidebar.warning("Daily query limit reached. Resets at midnight UTC.")
 
 
+def _reset_chat_state() -> None:
+    """Wipe chat-related state so stale charts/PDFs don't bleed into a new session."""
+    st.session_state["chat_history"] = []
+    st.session_state["lc_history"] = []
+    st.session_state["chart_store"] = {}
+    st.session_state.pop("_last_sub_questions", None)
+    for k in list(st.session_state.keys()):
+        if k.startswith("_pdf_cache_"):
+            del st.session_state[k]
+
+
 # ── Session controls (owner only) ──────────────────────────────────────────────
 
 def _render_session_controls() -> None:
@@ -203,14 +214,12 @@ def _render_session_controls() -> None:
 
     if c2.button("✨ New", use_container_width=True, key="btn_new_session"):
         auto_save_if_nonempty(st.session_state.get("chat_history", []))
-        st.session_state["chat_history"] = []
-        st.session_state["lc_history"] = []
+        _reset_chat_state()
         st.session_state["session_label"] = ""
         st.rerun()
 
     if c3.button("🗑 Clear", use_container_width=True, key="btn_clear_session"):
-        st.session_state["chat_history"] = []
-        st.session_state["lc_history"] = []
+        _reset_chat_state()
         st.rerun()
 
     st.sidebar.markdown("---")
@@ -362,11 +371,13 @@ def _dataset_detail(ds: dict) -> None:
 def render_sidebar() -> None:
     init_session_state()
 
-    # Run cleanup on startup (non-blocking: catches errors silently)
-    try:
-        cleanup_old_guest_datasets(max_age_hours=24)
-    except Exception:
-        pass
+    # Run cleanup once per session (Streamlit reruns sidebar on every interaction)
+    if not st.session_state.get("_cleanup_ran"):
+        try:
+            cleanup_old_guest_datasets(max_age_hours=24)
+        except Exception:
+            pass
+        st.session_state["_cleanup_ran"] = True
 
     st.sidebar.markdown(
         '<div class="sidebar-title">📊 Data Analysis Agent</div>',
