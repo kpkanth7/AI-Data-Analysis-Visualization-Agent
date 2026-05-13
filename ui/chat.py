@@ -74,10 +74,13 @@ def _render_table(rows: list[dict], table_key: str) -> None:
 def _render_result(analysis: AnalysisOutput, msg_key: str, chart_store: dict) -> None:
     """Render answer, data table, charts, and export buttons."""
 
-    # ── Multi-subquery path ────────────────────────────────────────────────────
+    # ── Multi-subquery path — side-by-side columns ────────────────────────────
     if analysis.sub_results:
-        for sub in analysis.sub_results:
-            with st.container():
+        n = len(analysis.sub_results)
+        cols = st.columns(min(n, 2))          # max 2 side-by-side; 3+ wraps to new rows
+        for idx, sub in enumerate(analysis.sub_results):
+            col = cols[idx % len(cols)]
+            with col:
                 st.markdown(f"**[{sub.index}] {sub.question}**")
                 st.markdown(sub.answer)
 
@@ -98,7 +101,7 @@ def _render_result(analysis: AnalysisOutput, msg_key: str, chart_store: dict) ->
                 if sub.export_path:
                     try:
                         with open(sub.export_path, "rb") as f:
-                            dl_col, _ = st.columns([1, 3])
+                            dl_col, _ = st.columns([1, 1])
                             with dl_col:
                                 st.download_button(
                                     "⬇ Download Excel",
@@ -165,27 +168,29 @@ def _render_steps_expander(steps: list[dict]) -> None:
 
 def _render_pdf_export_button(chart_store: dict) -> None:
     history = st.session_state.get("chat_history", [])
-    disabled = len(history) == 0
-    if st.button(
+    has_assistant = any(m.get("role") == "assistant" for m in history)
+    if not has_assistant:
+        st.button("📄 Export PDF", key="export_pdf_btn_disabled", disabled=True,
+                  help="Start a conversation first", use_container_width=True)
+        return
+    # Cache PDF bytes per history length so we don't rebuild on every rerun
+    cache_key = f"_pdf_cache_{len(history)}"
+    if cache_key not in st.session_state:
+        try:
+            st.session_state[cache_key] = session_to_pdf(history, charts=chart_store)
+        except Exception as e:
+            st.error(f"PDF export failed: {e}")
+            return
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.download_button(
         "📄 Export PDF",
+        data=st.session_state[cache_key],
+        file_name=f"session_{ts}.pdf",
+        mime="application/pdf",
         key="export_pdf_btn",
-        disabled=disabled,
-        help="Export this session as a structured PDF" if not disabled else "Start a conversation first",
+        help="Download this session as a structured PDF",
         use_container_width=True,
-    ):
-        with st.spinner("Building PDF…"):
-            try:
-                pdf_bytes = session_to_pdf(history, charts=chart_store)
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                st.download_button(
-                    "⬇ Download PDF",
-                    data=pdf_bytes,
-                    file_name=f"session_{ts}.pdf",
-                    mime="application/pdf",
-                    key=f"dl_pdf_{ts}",
-                )
-            except Exception as e:
-                st.error(f"PDF export failed: {e}")
+    )
 
 
 # ── Main tab renderer ──────────────────────────────────────────────────────────
@@ -225,12 +230,15 @@ def render_chat_tab() -> None:
 
             with st.chat_message("assistant", avatar="🤖"):
                 with st.spinner("Analysing…"):
-                    analysis, steps = run_agent(
+                    analysis, steps, used_sub_questions = run_agent(
                         query=pending,
                         chat_history=st.session_state.get("lc_history", []),
                         is_owner=is_owner(),
                         session_id=get_session_id(),
+                        last_sub_questions=st.session_state.get("_last_sub_questions", []),
                     )
+                    if used_sub_questions:
+                        st.session_state["_last_sub_questions"] = used_sub_questions
 
                 if analysis:
                     st.markdown(analysis.answer)
@@ -250,6 +258,9 @@ def render_chat_tab() -> None:
                     st.error("Agent returned no response. Try again.")
 
             record_query()
+            # Rerun so the PDF button (rendered above this container) sees the
+            # updated chat_history and enables itself.
+            st.rerun()
 
     # ── Chat input — always rendered after the container = always at bottom ────
     if not can_query():
