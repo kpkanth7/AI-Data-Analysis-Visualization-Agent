@@ -1,6 +1,6 @@
 # Data Analysis Agent
 
-**Live demo:** _coming soon on Streamlit Cloud — link will go here._
+**Live demo:** (https://ai-data-analysis-visualization-agent.streamlit.app/)
 
 A natural-language data analyst in your browser. Drop a CSV, ask a question in plain English, get back SQL, charts, and a clean answer. Full session history, structured PDF reports, and a multi-step cleaning wizard that handles the gross parts of real-world data for you.
 
