@@ -1,5 +1,7 @@
 # Data Analysis Agent
 
+**Live demo:** _coming soon on Streamlit Cloud — link will go here._
+
 A natural-language data analyst in your browser. Drop a CSV, ask a question in plain English, get back SQL, charts, and a clean answer. Full session history, structured PDF reports, and a multi-step cleaning wizard that handles the gross parts of real-world data for you.
 
 I built this end to end as a portfolio project. Streamlit on the front, LangChain + GPT-4o doing the agent work, Postgres + Chroma underneath. Proper guest-vs-owner separation, rate limiting, and a guided cleaning flow that I haven't really seen baked into other open analytics tools.
