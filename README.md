@@ -184,8 +184,4 @@ tests/                          pytest suite
 data/demo/                      sp500_financials, titanic, world_co2_emissions
 ```
 
-## What's next
 
-A small admin tab so I don't have to drop into a script to see usage. Streaming partial tokens into the chat bubble instead of waiting for the whole block. A Claude option wired through the same agent abstraction. And a real Chroma server instead of the single-process collection — fine at this scale, but I'd want it separated for anything bigger.
-
-— Pradhyumna
