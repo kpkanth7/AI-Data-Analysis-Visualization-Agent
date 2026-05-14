@@ -19,7 +19,14 @@ _BLOCKED = re.compile(
 
 
 def get_db_url() -> str:
-    return os.getenv("DATABASE_URL", "postgresql://pradhyumnakasula@localhost:5432/data_analyst")
+    url = os.getenv("DATABASE_URL", "")
+    if not url:
+        try:
+            import streamlit as st
+            url = st.secrets.get("DATABASE_URL", "")
+        except Exception:
+            url = ""
+    return url or "postgresql://pradhyumnakasula@localhost:5432/data_analyst"
 
 
 @lru_cache(maxsize=1)

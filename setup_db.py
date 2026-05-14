@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""One-time setup: create database, catalog table, load demo datasets."""
+"""One-time setup: create catalog tables, load demo datasets.
+
+Works against any Postgres connection string set in DATABASE_URL (local, Supabase, Neon, etc).
+Does NOT issue CREATE DATABASE — assumes the database already exists.
+"""
 import os
-import re
-import sys
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
@@ -11,29 +13,15 @@ from sqlalchemy.pool import NullPool
 
 load_dotenv()
 
-BASE_DB_URL = os.getenv("DATABASE_URL", "postgresql://pradhyumnakasula@localhost:5432/data_analyst")
-PG_ROOT_URL = BASE_DB_URL.rsplit("/", 1)[0] + "/postgres"
-DB_NAME = BASE_DB_URL.rsplit("/", 1)[-1]
-if not re.match(r'^[a-zA-Z0-9_]+$', DB_NAME):
-    raise ValueError(f"Invalid database name: {DB_NAME!r}. Only alphanumeric and underscores allowed.")
-
-
-def create_database():
-    engine = create_engine(PG_ROOT_URL, isolation_level="AUTOCOMMIT", poolclass=NullPool)
-    with engine.connect() as conn:
-        exists = conn.execute(
-            text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": DB_NAME}
-        ).fetchone()
-        if not exists:
-            conn.execute(text(f'CREATE DATABASE "{DB_NAME}"'))
-            print(f"Created database: {DB_NAME}")
-        else:
-            print(f"Database {DB_NAME} already exists.")
-    engine.dispose()
+DB_URL = os.getenv("DATABASE_URL", "")
+if not DB_URL:
+    raise SystemExit(
+        "DATABASE_URL is not set. Add it to .env (local) or your Streamlit Cloud secrets."
+    )
 
 
 def create_tables():
-    engine = create_engine(BASE_DB_URL, poolclass=NullPool)
+    engine = create_engine(DB_URL, poolclass=NullPool)
     with engine.connect() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS datasets (
@@ -44,22 +32,53 @@ def create_tables():
                 columns_json JSONB,
                 profile_json JSONB,
                 uploaded_at TIMESTAMP DEFAULT NOW(),
-                is_demo BOOLEAN DEFAULT FALSE
+                is_demo BOOLEAN DEFAULT FALSE,
+                owner_only BOOLEAN DEFAULT FALSE,
+                session_id TEXT
+            )
+        """))
+        # Backfill columns for older DBs that already have the table
+        for col_sql in (
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS owner_only BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE datasets ADD COLUMN IF NOT EXISTS session_id TEXT",
+        ):
+            try:
+                conn.execute(text(col_sql))
+            except Exception:
+                pass
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS guest_usage (
+                ip_hash      TEXT NOT NULL,
+                usage_date   DATE NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::DATE,
+                queries      INTEGER NOT NULL DEFAULT 0,
+                uploads      INTEGER NOT NULL DEFAULT 0,
+                upload_bytes BIGINT  NOT NULL DEFAULT 0,
+                PRIMARY KEY (ip_hash, usage_date)
             )
         """))
         conn.commit()
-    print("Tables created.")
+    print("Tables ready.")
     engine.dispose()
 
 
 def load_demo_data():
     from db.postgres import slugify, register_dataset
     from core.dataset_profiler import profile_dataframe
+    try:
+        from db.vector_store import index_dataset_in_chroma
+        _chroma_ok = True
+    except Exception:
+        _chroma_ok = False
 
     demo_dir = Path("data/demo")
+    if not demo_dir.exists():
+        print("No data/demo directory — skipping demo load.")
+        return
+
     for csv_file in demo_dir.glob("*.csv"):
         try:
-            df = pd.read_csv(csv_file, parse_dates=True)
+            df = pd.read_csv(csv_file)
             for col in df.columns:
                 if "date" in col.lower() or "time" in col.lower():
                     try:
@@ -68,17 +87,21 @@ def load_demo_data():
                         pass
             slug = slugify(csv_file.name)
             profile = profile_dataframe(df)
-            engine = create_engine(BASE_DB_URL, poolclass=NullPool)
+            engine = create_engine(DB_URL, poolclass=NullPool)
             df.to_sql(slug, engine, if_exists="replace", index=False)
             engine.dispose()
             register_dataset(csv_file.name, slug, df, profile, is_demo=True)
-            print(f"Loaded demo: {csv_file.name} → table '{slug}' ({len(df)} rows)")
+            if _chroma_ok:
+                try:
+                    index_dataset_in_chroma(slug, df.columns.tolist(), profile)
+                except Exception as e:
+                    print(f"  (Chroma index skipped for {slug}: {e})")
+            print(f"Loaded demo: {csv_file.name} -> '{slug}' ({len(df)} rows)")
         except Exception as e:
             print(f"Failed to load {csv_file.name}: {e}")
 
 
 if __name__ == "__main__":
-    create_database()
     create_tables()
     load_demo_data()
     print("\nSetup complete. Run: streamlit run app.py")
