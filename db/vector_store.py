@@ -8,9 +8,9 @@ load_dotenv()
 
 CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 COLLECTION_NAME = "dataset_metadata"
-_EMBED_FN = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
-)
+# ONNX MiniLM bundled with chromadb — same model as SentenceTransformer
+# variant but without torch/cuda baggage. Much lighter for cloud deploy.
+_EMBED_FN = embedding_functions.DefaultEmbeddingFunction()
 
 
 @lru_cache(maxsize=1)
