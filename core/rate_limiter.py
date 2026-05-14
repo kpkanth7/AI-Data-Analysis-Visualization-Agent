@@ -33,6 +33,26 @@ def get_ip_hash() -> str:
     return st.session_state["ip_hash"]
 
 
+def get_browser_fingerprint() -> str:
+    """Stable hash of IP + User-Agent + Accept-Language.
+    - Same browser refresh → same hash (datasets persist across reloads)
+    - Different network/browser (friend opening shared link) → different hash (fresh page)
+    - Different concurrent users on same NAT → almost always different UA → different hash
+    Used for guest dataset scoping; rate limiting still keys on IP only."""
+    if "browser_fp" not in st.session_state:
+        try:
+            headers = st.context.headers
+            ip = get_client_ip()
+            ua = headers.get("User-Agent", "")
+            lang = headers.get("Accept-Language", "")
+            raw = f"daa-fp-2024:{ip}|{ua}|{lang}"
+            st.session_state["browser_fp"] = hashlib.sha256(raw.encode()).hexdigest()[:32]
+        except Exception:
+            import uuid
+            st.session_state["browser_fp"] = uuid.uuid4().hex
+    return st.session_state["browser_fp"]
+
+
 def get_guest_limits() -> dict:
     """Return current usage + remaining for the calling guest."""
     ip_hash = get_ip_hash()
@@ -45,10 +65,7 @@ def get_guest_limits() -> dict:
         "upload_bytes_used": usage["upload_bytes"],
         "upload_bytes_remaining": max(0, GUEST_UPLOAD_TOTAL_BYTES - usage["upload_bytes"]),
         "can_query": usage["queries"] < GUEST_QUERY_LIMIT,
-        "can_upload": (
-            usage["uploads"] < GUEST_UPLOAD_LIMIT
-            and usage["upload_bytes"] < GUEST_UPLOAD_TOTAL_BYTES
-        ),
+        "can_upload": True,
     }
 
 

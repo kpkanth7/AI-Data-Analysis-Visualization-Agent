@@ -58,19 +58,19 @@ def build_chart(config: dict | str) -> go.Figure:
 
 def _common_layout(fig: go.Figure, title: str, x_label: str = "", y_label: str = "") -> go.Figure:
     fig.update_layout(
-        title=dict(text=title, font=dict(size=17, color="#F1F5F9"), x=0, xanchor="left"),
+        title=dict(text=title, font=dict(size=17, color="#F1F5F9"), x=0, xanchor="left", y=0.97, yanchor="top"),
         template=TEMPLATE,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Inter, sans-serif", color="#CBD5E1", size=12),
         legend=dict(
             orientation="h",
-            yanchor="bottom", y=1.04,
-            xanchor="left", x=0,
+            yanchor="bottom", y=1.02,
+            xanchor="right", x=1,
             font=dict(size=12),
             bgcolor="rgba(0,0,0,0)",
         ),
-        margin=dict(l=60, r=30, t=70, b=60),
+        margin=dict(l=60, r=30, t=110, b=60),
         hoverlabel=dict(bgcolor="#1E293B", font_size=13, font_color="#F1F5F9", bordercolor="#334155"),
         xaxis=dict(
             title=dict(text=x_label, font=dict(size=13, color="#94A3B8")),
@@ -106,17 +106,27 @@ def _bar(df, x, y, title, color=None, barmode="group"):
         df, x=x, y=y, color=color, title=title, template=TEMPLATE,
         barmode=barmode, color_discrete_sequence=COLORS,
     )
-    if barmode != "stack":
-        # Only show value labels when bars aren't too many
-        if len(df) <= 30:
-            fig.update_traces(
-                text=df[y] if y and y in df.columns else None,
-                texttemplate="%{y:,.0f}",
-                textposition="outside",
-                textfont=dict(size=11, color="#CBD5E1"),
-            )
+    # Value labels only when uncluttered: ≤12 bars and no color split (or ≤2 groups)
+    n_groups = df[color].nunique() if color and color in df.columns else 1
+    show_labels = barmode != "stack" and len(df) <= 12 and n_groups <= 2
+    if show_labels:
+        fig.update_traces(
+            texttemplate="%{y:,.0f}",
+            textposition="outside",
+            textfont=dict(size=10, color="#94A3B8"),
+            cliponaxis=False,
+        )
     fig.update_traces(marker_line_width=0)
-    return _common_layout(fig, title, _fmt(x), _fmt(y))
+    fig = _common_layout(fig, title, _fmt(x), _fmt(y))
+    # Pad y-axis so outside labels don't clip into title
+    if show_labels and y and y in df.columns:
+        try:
+            ymax = float(pd.to_numeric(df[y], errors="coerce").max())
+            if ymax > 0:
+                fig.update_yaxes(range=[0, ymax * 1.18])
+        except Exception:
+            pass
+    return fig
 
 
 def _scatter(df, x, y, title, color=None):

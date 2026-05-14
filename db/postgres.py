@@ -45,6 +45,9 @@ def slugify(name: str) -> str:
     return name
 
 
+MAX_QUERY_ROWS = 5000
+
+
 def execute_sql(sql: str, params: dict | None = None) -> list[dict]:
     if _BLOCKED.search(sql):
         raise ValueError("Only SELECT statements are allowed.")
@@ -52,7 +55,7 @@ def execute_sql(sql: str, params: dict | None = None) -> list[dict]:
         raise ValueError("Only SELECT statements are allowed.")
     with get_connection() as conn:
         result = conn.execute(text(sql), params or {})
-        rows = [dict(row._mapping) for row in result.fetchmany(1000)]
+        rows = [dict(row._mapping) for row in result.fetchmany(MAX_QUERY_ROWS + 1)]
     return rows
 
 
@@ -130,12 +133,31 @@ def register_dataset(
 
 
 def delete_dataset(slug: str) -> None:
-    """Remove dataset record and drop its PostgreSQL table."""
+    """Remove dataset record, drop its PostgreSQL table, and purge Chroma entries."""
+    # Fetch columns before deletion for Chroma cleanup
+    columns: list[str] = []
     with get_connection() as conn:
+        result = conn.execute(
+            text("SELECT columns_json FROM datasets WHERE slug = :slug"),
+            {"slug": slug},
+        )
+        row = result.fetchone()
+        if row and row[0]:
+            cols = row[0]
+            if isinstance(cols, str):
+                cols = json.loads(cols)
+            columns = [c["name"] for c in cols if isinstance(c, dict) and "name" in c]
         conn.execute(text("DELETE FROM datasets WHERE slug = :slug"), {"slug": slug})
         # Safe: slug is validated by slugify() which only allows [a-z0-9_]
         conn.execute(text(f'DROP TABLE IF EXISTS "{slug}"'))
         conn.commit()
+    # Purge Chroma — failures here are non-fatal
+    if columns:
+        try:
+            from db.vector_store import remove_dataset_from_chroma
+            remove_dataset_from_chroma(slug, columns)
+        except Exception:
+            pass
 
 
 def delete_guest_session_datasets(session_id: str) -> None:
@@ -186,7 +208,7 @@ def ensure_guest_usage_table() -> None:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS guest_usage (
                 ip_hash     TEXT NOT NULL,
-                usage_date  DATE NOT NULL DEFAULT CURRENT_DATE,
+                usage_date  DATE NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::DATE,
                 queries     INTEGER NOT NULL DEFAULT 0,
                 uploads     INTEGER NOT NULL DEFAULT 0,
                 upload_bytes BIGINT NOT NULL DEFAULT 0,
@@ -201,7 +223,7 @@ def get_guest_usage(ip_hash: str) -> dict:
         result = conn.execute(text("""
             SELECT queries, uploads, upload_bytes
             FROM guest_usage
-            WHERE ip_hash = :h AND usage_date = CURRENT_DATE
+            WHERE ip_hash = :h AND usage_date = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::DATE
         """), {"h": ip_hash})
         row = result.fetchone()
         if row:
@@ -213,7 +235,7 @@ def increment_guest_query(ip_hash: str) -> None:
     with get_connection() as conn:
         conn.execute(text("""
             INSERT INTO guest_usage (ip_hash, usage_date, queries)
-            VALUES (:h, CURRENT_DATE, 1)
+            VALUES (:h, (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::DATE, 1)
             ON CONFLICT (ip_hash, usage_date) DO UPDATE
             SET queries = guest_usage.queries + 1
         """), {"h": ip_hash})
@@ -224,7 +246,7 @@ def increment_guest_upload(ip_hash: str, file_bytes: int) -> None:
     with get_connection() as conn:
         conn.execute(text("""
             INSERT INTO guest_usage (ip_hash, usage_date, uploads, upload_bytes)
-            VALUES (:h, CURRENT_DATE, 1, :b)
+            VALUES (:h, (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::DATE, 1, :b)
             ON CONFLICT (ip_hash, usage_date) DO UPDATE
             SET uploads = guest_usage.uploads + 1,
                 upload_bytes = guest_usage.upload_bytes + :b

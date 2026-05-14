@@ -22,12 +22,20 @@ def profile_dataframe(df: pd.DataFrame) -> dict:
             "is_datetime": is_dt,
         }
         if is_num:
-            entry.update({
-                "min": float(series.min()),
-                "max": float(series.max()),
-                "mean": float(series.mean()),
-                "std": float(series.std()),
-            })
+            clean = series.dropna()
+            def _safe(v):
+                try:
+                    f = float(v)
+                    return f if np.isfinite(f) else None
+                except (TypeError, ValueError):
+                    return None
+            if len(clean):
+                entry.update({
+                    "min": _safe(clean.min()),
+                    "max": _safe(clean.max()),
+                    "mean": _safe(clean.mean()),
+                    "std": _safe(clean.std()) if len(clean) > 1 else None,
+                })
         profile[col] = entry
     return profile
 

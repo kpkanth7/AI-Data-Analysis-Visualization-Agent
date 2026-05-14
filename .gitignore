@@ -23,3 +23,8 @@ logs/
 
 # Dev-only scripts (local use, not for repo)
 scripts/reset_guest_limit.py
+
+# Local planning / handoff notes (not for repo)
+HANDOFF.md
+tasks/
+docs/superpowers/

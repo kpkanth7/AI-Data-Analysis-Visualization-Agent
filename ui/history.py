@@ -3,19 +3,26 @@ import streamlit as st
 import pandas as pd
 
 from core.session_manager import list_sessions, delete_session, load_session
-from ui.sidebar import is_owner
+from ui.auth import is_owner
 
 
 def render_history_tab() -> None:
     if not is_owner():
-        st.info("Session history is available to the owner only.")
+        st.markdown(
+            '<div class="locked-banner">'
+            '🔒 <span style="color:#fff">History is for the owner only.</span>'
+            '<span class="sub">Saved sessions, transcripts, and exports live here — '
+            'sign in as owner to unlock.</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
         return
 
     st.markdown("### 📜 Saved Sessions")
 
     sessions = list_sessions()
     if not sessions:
-        st.info("No sessions saved yet. Use **💾 Save** in the sidebar to save a session.")
+        st.info("No sessions saved yet.")
         return
 
     st.caption(f"{len(sessions)} saved session(s)")

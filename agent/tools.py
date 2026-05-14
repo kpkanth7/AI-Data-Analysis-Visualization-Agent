@@ -2,11 +2,12 @@ import json
 import datetime
 import os
 import threading
+from typing import Optional
 
 import pandas as pd
 from langchain.tools import tool
 
-from db.postgres import execute_sql, list_datasets_from_db, get_engine
+from db.postgres import execute_sql, list_datasets_from_db, get_engine, MAX_QUERY_ROWS
 from db.vector_store import search_metadata
 from core.anomaly import detect_anomalies, detect_trends
 from core.exporter import export_to_excel
@@ -85,12 +86,22 @@ def search_metadata_tool(query: str) -> str:
 
 @tool
 def query_sql(sql: str) -> str:
-    """Run a SELECT SQL query against PostgreSQL. Returns up to 1000 rows as JSON."""
+    """Run a SELECT SQL query against PostgreSQL. Returns up to MAX_QUERY_ROWS rows as JSON.
+    If `truncated` is true, the underlying result exceeded the cap — add LIMIT or aggregate."""
     try:
         rows = execute_sql(sql)
+        truncated = len(rows) > MAX_QUERY_ROWS
+        if truncated:
+            rows = rows[:MAX_QUERY_ROWS]
         if not rows:
-            return json.dumps({"total_rows": 0, "preview": [], "all_rows": []})
-        return json.dumps({"total_rows": len(rows), "preview": rows[:10], "all_rows": rows}, default=str)
+            return json.dumps({"total_rows": 0, "preview": [], "all_rows": [], "truncated": False})
+        return json.dumps({
+            "total_rows": len(rows),
+            "preview": rows[:10],
+            "all_rows": rows,
+            "truncated": truncated,
+            "row_cap": MAX_QUERY_ROWS,
+        }, default=str)
     except Exception as e:
         return f"SQL error: {e}"
 
@@ -112,7 +123,7 @@ def query_pandas(table: str, expression: str) -> str:
 
 
 @tool
-def compute_stats(table: str, column: str, metrics: list[str] = None) -> str:
+def compute_stats(table: str, column: str, metrics: Optional[list[str]] = None) -> str:
     """Compute statistics (sum, avg, median, std, min, max, count) on a numeric column."""
     if metrics is None:
         metrics = ["sum", "avg", "min", "max", "count", "std"]
@@ -188,10 +199,10 @@ def create_visualization(
     chart_type: str,
     data: list,
     title: str = "",
-    x: str = None,
-    y: str = None,
-    color: str = None,
-    anomaly_col: str = None,
+    x: Optional[str] = None,
+    y: Optional[str] = None,
+    color: Optional[str] = None,
+    anomaly_col: Optional[str] = None,
 ) -> str:
     """
     Create a Plotly chart specification.
@@ -217,7 +228,7 @@ def create_visualization(
 
 
 @tool
-def export_data(table: str, sql: str = None) -> str:
+def export_data(table: str, sql: Optional[str] = None) -> str:
     """Export a table or SQL query result to a styled Excel file. Returns the file path."""
     try:
         _guard_table(table)

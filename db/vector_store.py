@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 from dotenv import load_dotenv
 import chromadb
 from chromadb.utils import embedding_functions
@@ -12,10 +13,12 @@ _EMBED_FN = embedding_functions.SentenceTransformerEmbeddingFunction(
 )
 
 
+@lru_cache(maxsize=1)
 def _get_client() -> chromadb.PersistentClient:
     return chromadb.PersistentClient(path=CHROMA_DIR)
 
 
+@lru_cache(maxsize=1)
 def _get_collection():
     client = _get_client()
     return client.get_or_create_collection(

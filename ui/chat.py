@@ -7,7 +7,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from agent.agent import run_agent
 from agent.schema import AnalysisOutput, SubQueryResult
 from ui.charts import build_chart
-from ui.sidebar import can_query, record_query, is_owner, get_session_id
+from ui.auth import can_query, record_query, is_owner, get_session_id
 from core.pdf_export import chart_to_png, dataframe_to_csv, session_to_pdf
 
 
@@ -202,9 +202,14 @@ def render_chat_tab() -> None:
 
     # ── Header row: title + PDF export ────────────────────────────────────────
     hcol, pcol = st.columns([5, 1])
-    hcol.markdown("#### 💬 Ask Your Data")
+    hcol.markdown(
+        '<div class="section-head" style="margin-top:14px">'
+        '<span class="dot"></span><h4>💬 Ask Your Data</h4></div>',
+        unsafe_allow_html=True,
+    )
     with pcol:
         _render_pdf_export_button(chart_store)
+
 
     # ── Scrollable message area ────────────────────────────────────────────────
     # Fixed-height container keeps the chat input anchored below it at all times.
@@ -258,17 +263,16 @@ def render_chat_tab() -> None:
                     st.error("Agent returned no response. Try again.")
 
             record_query()
-            # Rerun so the PDF button (rendered above this container) sees the
-            # updated chat_history and enables itself.
             st.rerun()
 
-    # ── Chat input — always rendered after the container = always at bottom ────
     if not can_query():
         st.info("Daily query limit reached. Resets at midnight UTC.")
         return
 
-    query = st.chat_input("Ask anything about your data…", key="chat_input")
+    query = st.chat_input(
+        "Ask anything about your data — e.g. top 10 by revenue, trend over time, anomalies",
+        key="chat_input",
+    )
     if query:
-        # Store query and rerun so it's processed inside the container above
         st.session_state["_pending_query"] = query
         st.rerun()

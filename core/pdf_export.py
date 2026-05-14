@@ -18,7 +18,7 @@ except ImportError:
 # ── PNG / CSV exports ─────────────────────────────────────────────────────────
 
 def chart_to_png(fig) -> bytes:
-    return fig.to_image(format="png", width=1000, height=500, scale=2)
+    return fig.to_image(format="png", width=1200, height=600, scale=2)
 
 
 def dataframe_to_csv(rows: list[dict]) -> bytes:
@@ -241,7 +241,7 @@ def _draw_analysis(pdf: "FPDF", analysis, actual_idx: int, charts) -> None:
     ds = getattr(analysis, "datasets_used", []) or []
     if ds:
         pdf.set_font("Helvetica", "I", 8)
-        pdf.set_text_color(148, 163, 184)
+        pdf.set_text_color(51, 65, 85)
         pdf.cell(0, 5, _s(f"Source: {', '.join(ds)}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_text_color(30, 30, 30)
         pdf.ln(1)
@@ -249,7 +249,7 @@ def _draw_analysis(pdf: "FPDF", analysis, actual_idx: int, charts) -> None:
 
 def _section_label(pdf: "FPDF", label: str) -> None:
     pdf.set_font("Helvetica", "B", 8)
-    pdf.set_text_color(100, 116, 139)
+    pdf.set_text_color(30, 41, 59)
     pdf.cell(0, 5, _s(label.upper()), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_text_color(30, 30, 30)
     pdf.ln(1)
@@ -267,7 +267,7 @@ def _draw_sql_block(pdf: "FPDF", sql: str) -> None:
     pdf.set_fill_color(248, 250, 252)
     pdf.set_draw_color(203, 213, 225)
     pdf.set_font("Courier", "", 8)
-    pdf.set_text_color(51, 65, 85)
+    pdf.set_text_color(15, 23, 42)
     sql_clean = _s(sql.strip()[:2000])
     pdf.multi_cell(
         0, 4.5, sql_clean,
@@ -299,7 +299,7 @@ def _write_inline(pdf: "FPDF", line: str) -> None:
     if is_bullet:
         line = re.sub(r"^[-*]\s+", "", line).strip()
         pdf.set_font("Helvetica", "", 10)
-        pdf.set_text_color(100, 116, 139)
+        pdf.set_text_color(30, 41, 59)
         pdf.write(5, "  - ")
         pdf.set_text_color(30, 30, 30)
 
@@ -368,14 +368,21 @@ def _write_table(pdf: "FPDF", rows: list[dict]) -> None:
 # ── Chart embed ───────────────────────────────────────────────────────────────
 
 def _embed_chart(pdf: "FPDF", fig) -> None:
+    """Fit chart to remaining page height (min 55mm, max 80mm) to avoid blank pages."""
     try:
         png = chart_to_png(fig)
         buf = io.BytesIO(png)
-        chart_h = 90
         page_h = pdf.h - pdf.b_margin
-        if pdf.get_y() + chart_h + 4 > page_h:
+        remaining = page_h - pdf.get_y() - 4
+        min_h, max_h = 55, 80
+        if remaining < min_h:
             pdf.add_page()
-        pdf.image(buf, x=15, y=pdf.get_y(), w=180, h=chart_h)
-        pdf.ln(chart_h + 3)
+            remaining = page_h - pdf.get_y() - 4
+        chart_h = min(max_h, max(min_h, remaining))
+        # 16:8 ratio kept by width 180mm; clamp aspect by computing width if needed
+        chart_w = min(180, chart_h * 2.0)
+        x_offset = 15 + (180 - chart_w) / 2
+        pdf.image(buf, x=x_offset, y=pdf.get_y(), w=chart_w, h=chart_h)
+        pdf.ln(chart_h + 2)
     except Exception:
         pass
