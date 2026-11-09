@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.pool import NullPool
 
 load_dotenv()
@@ -31,7 +32,19 @@ def get_db_url() -> str:
 
 @lru_cache(maxsize=1)
 def get_engine():
-    return create_engine(get_db_url(), poolclass=NullPool)
+    return create_engine(normalize_db_url(get_db_url()), poolclass=NullPool)
+
+
+def normalize_db_url(url: str) -> URL:
+    """Use the installed psycopg2 driver unless a driver was explicitly chosen.
+
+    SQLAlchemy 2.1 changed the default for bare PostgreSQL URLs to psycopg 3.
+    Keep the URL object intact so encoded credentials/options are not lost.
+    """
+    parsed = make_url(url)
+    if parsed.drivername in {"postgresql", "postgres"}:
+        return parsed.set(drivername="postgresql+psycopg2")
+    return parsed
 
 
 @contextmanager

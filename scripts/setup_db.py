@@ -10,6 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
+from db.postgres import normalize_db_url
 
 load_dotenv()
 
@@ -18,6 +19,7 @@ if not DB_URL:
     raise SystemExit(
         "DATABASE_URL is not set. Add it to .env (local) or your Streamlit Cloud secrets."
     )
+DB_URL = normalize_db_url(DB_URL)
 
 
 def create_tables():

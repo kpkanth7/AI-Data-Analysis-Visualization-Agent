@@ -10,7 +10,8 @@ from core.rate_limiter import (
     validate_upload_file,
     GUEST_UPLOAD_LIMIT,
 )
-from ui.auth import is_owner, get_session_id, invalidate_limits_cache
+from ui.auth import is_owner, get_session_id, invalidate_limits_cache, can_upload, get_cached_limits
+from ui.service_status import render_service_unavailable
 from ui.cleaning_wizard_ui import (
     render_cleaning_wizard,
     start_wizard,
@@ -89,6 +90,9 @@ def _render_upload_section(owner: bool, sid: str, active_count: int) -> None:
     _section_header("⬆️ Upload Dataset")
 
     if not owner:
+        if not get_cached_limits()["available"]:
+            render_service_unavailable("Usage", "upload_usage")
+            return
         if active_count >= GUEST_UPLOAD_LIMIT:
             st.warning(
                 f"Session file limit reached ({GUEST_UPLOAD_LIMIT} files). "
@@ -122,6 +126,9 @@ def _render_upload_section(owner: bool, sid: str, active_count: int) -> None:
     b1, b2 = st.columns(2)
     with b1:
         if st.button("⬆️ Upload", key="btn_plain_upload", type="primary", use_container_width=True):
+            if not can_upload():
+                render_service_unavailable("Usage", "upload_admission")
+                return
             with st.status(f"Ingesting {uploaded.name}…"):
                 try:
                     df = read_uploaded_file(uploaded)
@@ -172,7 +179,7 @@ def render_data_tab() -> None:
     try:
         all_ds = list_datasets_from_db(include_owner_only=owner, session_id=sid)
     except Exception as e:
-        st.error(f"Could not load datasets: {e}")
+        render_service_unavailable("Dataset", "data", e)
         return
 
     demo_ds = [d for d in all_ds if d.get("is_demo")]

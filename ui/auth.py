@@ -43,7 +43,7 @@ def can_query() -> bool:
     try:
         return get_cached_limits()["can_query"]
     except Exception:
-        return st.session_state.get("_fallback_queries", 0) < 10
+        return False
 
 
 def can_upload() -> bool:
@@ -52,7 +52,7 @@ def can_upload() -> bool:
     try:
         return get_cached_limits()["can_upload"]
     except Exception:
-        return True
+        return False
 
 
 def record_query() -> None:
@@ -68,15 +68,16 @@ def record_query() -> None:
 
 def get_cached_limits() -> dict:
     """Always-fresh DB read. No session-state caching — external resets propagate immediately."""
-    if "guest_session_id" not in st.session_state:
-        return {"queries_remaining": 10, "uploads_remaining": 5, "can_query": True, "can_upload": True}
+    unavailable = {
+        "available": False, "queries_remaining": None, "uploads_remaining": None,
+        "can_query": False, "can_upload": False,
+    }
+    if not st.session_state.get("guest_session_id"):
+        return unavailable
     try:
-        return get_guest_limits()
+        return {**get_guest_limits(), "available": True}
     except Exception:
-        return {
-            "queries_remaining": 10, "uploads_remaining": 5,
-            "can_query": True, "can_upload": True,
-        }
+        return unavailable
 
 
 def invalidate_limits_cache() -> None:
@@ -116,6 +117,8 @@ def reset_chat_state() -> None:
     st.session_state["lc_history"] = []
     st.session_state["chart_store"] = {}
     st.session_state.pop("_last_sub_questions", None)
+    st.session_state.pop("_pending_query", None)
+    st.session_state.pop("_unsent_query", None)
     for k in list(st.session_state.keys()):
         if k.startswith("_pdf_cache_"):
             del st.session_state[k]

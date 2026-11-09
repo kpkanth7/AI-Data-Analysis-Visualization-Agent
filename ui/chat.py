@@ -7,7 +7,9 @@ from langchain_core.messages import HumanMessage, AIMessage
 from agent.agent import run_agent
 from agent.schema import AnalysisOutput, SubQueryResult
 from ui.charts import build_chart
-from ui.auth import can_query, record_query, is_owner, get_session_id
+from ui.auth import can_query, record_query, is_owner, get_session_id, get_cached_limits
+from ui.service_status import render_service_unavailable
+from db.postgres import list_datasets_from_db
 from core.pdf_export import chart_to_png, dataframe_to_csv, session_to_pdf
 
 
@@ -210,11 +212,37 @@ def render_chat_tab() -> None:
     with pcol:
         _render_pdf_export_button(chart_store)
 
+    datasets = None
+    try:
+        datasets = list_datasets_from_db(include_owner_only=is_owner(), session_id=get_session_id())
+    except Exception as exc:
+        render_service_unavailable("Dataset", "chat", exc)
+
+    limits = None if is_owner() else get_cached_limits()
+    query_allowed = is_owner() or limits["can_query"]
+    if limits is not None and not limits["available"]:
+        render_service_unavailable("Usage", "chat_usage")
+    elif not query_allowed:
+        st.info("Daily query limit reached. Resets at midnight UTC.")
+    ready = bool(datasets) and query_allowed
+
+    history = st.session_state.get("chat_history", [])
+    if datasets:
+        names = ", ".join(str(ds.get("name", ds["slug"]))[:80] for ds in datasets[:5])
+        suffix = f" and {len(datasets) - 5} more" if len(datasets) > 5 else ""
+        st.text(f"Available datasets: {names}{suffix}")
+        if not history:
+            st.markdown("Ask a question about one of these datasets.")
+            st.caption("Include the dataset name in your question. Browse its columns in Data or Explorer.")
+            # Only suggest a concrete question when its dataset is in the current catalog.
+            st.text(f"Try: How many rows are in {datasets[0]['slug']}?")
+    elif datasets == []:
+        st.info("No datasets are available yet. Open the Data tab to upload a CSV or Excel file.")
 
     # ── Scrollable message area ────────────────────────────────────────────────
-    # Fixed-height container keeps the chat input anchored below it at all times.
-    with st.container(height=560, border=False):
-        history = st.session_state.get("chat_history", [])
+    # Reserve scrolling space only once there are messages; keep first-use input visible.
+    message_area = st.container(height=420, border=False) if history else st.container(border=False)
+    with message_area:
 
         # Render persisted messages
         for i, msg in enumerate(history):
@@ -228,6 +256,12 @@ def render_chat_tab() -> None:
 
         # Process any pending query (stored by previous run)
         pending = st.session_state.pop("_pending_query", None)
+        # Recheck admission immediately before any planner/model call. A query
+        # queued on the previous render is not permission to spend during an outage.
+        if pending and (not ready or not can_query()):
+            ready = False
+            st.session_state["_unsent_query"] = pending
+            pending = None
         if pending:
             with st.chat_message("user", avatar="🧑"):
                 st.markdown(pending)
@@ -265,14 +299,20 @@ def render_chat_tab() -> None:
             record_query()
             st.rerun()
 
-    if not can_query():
-        st.info("Daily query limit reached. Resets at midnight UTC.")
-        return
+    unsent = st.session_state.get("_unsent_query")
+    if unsent:
+        st.info("Your question was not sent. Retry it when data and usage are available.")
+        st.text(unsent)
+        if st.button("Retry question", key="retry_question", disabled=not ready):
+            st.session_state["_pending_query"] = st.session_state.pop("_unsent_query")
+            st.rerun()
 
     query = st.chat_input(
-        "Ask anything about your data — e.g. top 10 by revenue, trend over time, anomalies",
+        "Ask a question about an available dataset" if ready else "Waiting for datasets and usage availability",
         key="chat_input",
+        disabled=not ready,
     )
     if query:
+        st.session_state.pop("_unsent_query", None)
         st.session_state["_pending_query"] = query
         st.rerun()

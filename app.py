@@ -141,12 +141,11 @@ p, .stMarkdown { color: var(--text-1); line-height: 1.55; }
 .tb-chip-warn { border-color: rgba(245,158,11,0.55); color: #fed7aa; box-shadow: 0 0 18px rgba(245,158,11,0.18); }
 .tb-chip-bad  { border-color: rgba(239,68,68,0.6);  color: #fecaca; box-shadow: 0 0 18px rgba(239,68,68,0.22); }
 
-/* Avatar (popover trigger) */
+/* Account/sign-in popover trigger */
 [data-testid="stPopover"] button {
-    border-radius: 50% !important;
-    width: 42px !important;
-    height: 42px !important;
-    padding: 0 !important;
+    border-radius: 12px !important;
+    min-height: 42px !important;
+    padding: 6px 14px !important;
     background: linear-gradient(135deg, #6366f1, #a855f7, #ec4899) !important;
     color: #fff !important;
     border: 2px solid rgba(255,255,255,0.12) !important;
@@ -269,7 +268,7 @@ p, .stMarkdown { color: var(--text-1); line-height: 1.55; }
     background: transparent !important;
 }
 [data-testid="stChatInput"] textarea::placeholder {
-    color: var(--text-3) !important;
+    color: var(--text-2) !important;
 }
 
 /* ── Expanders (cards) ────────────────────────────────────────── */

@@ -139,9 +139,11 @@ cd "data analysis agent"
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # then fill in OPENAI_API_KEY and DATABASE_URL
-python setup_db.py     # creates tables, loads demo datasets
+python -m scripts.setup_db  # creates tables, loads demo datasets
 streamlit run app.py
 ```
+
+Use `postgresql+psycopg2://...` for `DATABASE_URL`. Bare PostgreSQL URLs use the same driver. To check installed versions and the configured driver without connecting, run `python -m scripts.check_db_runtime`.
 
 For owner access, add `owner_password = "yourpassword"` to `.streamlit/secrets.toml`.
 

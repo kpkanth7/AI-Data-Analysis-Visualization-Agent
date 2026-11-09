@@ -6,10 +6,10 @@ from ui.auth import (
     init_session_state,
     is_owner,
     get_cached_limits,
-    switch_to_owner,
     switch_to_guest,
 )
 from db.postgres import cleanup_old_guest_datasets
+from ui.login import render_owner_login
 
 
 def _utc_today() -> str:
@@ -20,6 +20,8 @@ def _countdown_chip() -> str:
     if is_owner():
         return '<span class="tb-chip tb-chip-owner">👑 Owner · Unlimited</span>'
     limits = get_cached_limits()
+    if not limits["available"]:
+        return '<span class="tb-chip tb-chip-warn">👤 Guest · Usage unavailable</span>'
     q = limits.get("queries_remaining", 10)
     tone = "good" if q > 4 else ("warn" if q > 1 else "bad")
     return (
@@ -30,8 +32,7 @@ def _countdown_chip() -> str:
 
 def _render_avatar_popover() -> None:
     owner = is_owner()
-    initial = "O" if owner else "G"
-    label = f"  {initial}  "
+    label = "Account" if owner else "Sign in"
     with st.popover(label, use_container_width=False):
         if owner:
             st.markdown("**👑 Owner**")
@@ -44,24 +45,16 @@ def _render_avatar_popover() -> None:
         else:
             limits = get_cached_limits()
             st.markdown("**👤 Guest**")
-            st.caption(
-                f"{limits.get('queries_remaining', 10)}/10 queries left · "
-                f"{limits.get('uploads_remaining', 5)}/5 uploads · 10 MB each"
-            )
+            if limits["available"]:
+                st.caption(
+                    f"{limits['queries_remaining']}/10 queries left · "
+                    f"{limits['uploads_remaining']}/5 uploads · 10 MB each"
+                )
+            else:
+                st.caption("Usage unavailable · New AI requests and guest uploads are paused.")
             st.markdown("---")
-            st.markdown("**Switch to Owner**")
-            pw = st.text_input(
-                "Owner password",
-                type="password",
-                key="topbar_owner_pw",
-                placeholder="Enter password…",
-                label_visibility="collapsed",
-            )
-            if st.button("Unlock →", key="topbar_unlock", type="primary", use_container_width=True):
-                if switch_to_owner(pw):
-                    st.rerun()
-            if st.session_state.get("_login_error"):
-                st.error(st.session_state["_login_error"])
+            st.markdown("**Owner sign-in**")
+            render_owner_login("topbar")
 
 
 def render_topbar() -> None:
@@ -76,7 +69,7 @@ def render_topbar() -> None:
             pass
         st.session_state["_cleanup_day"] = today
 
-    title_col, chip_col, avatar_col = st.columns([5, 4, 1])
+    title_col, chip_col, avatar_col = st.columns([5, 4, 2])
 
     with title_col:
         st.markdown(

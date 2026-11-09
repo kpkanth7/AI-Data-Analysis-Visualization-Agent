@@ -4,6 +4,7 @@ import pandas as pd
 
 from core.session_manager import list_sessions, delete_session, load_session
 from ui.auth import is_owner
+from ui.login import render_owner_login
 
 
 def render_history_tab() -> None:
@@ -16,6 +17,7 @@ def render_history_tab() -> None:
             '</div>',
             unsafe_allow_html=True,
         )
+        render_owner_login("history")
         return
 
     st.markdown("### 📜 Saved Sessions")

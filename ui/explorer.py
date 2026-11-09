@@ -4,13 +4,16 @@ from sqlalchemy import text
 
 from db.postgres import list_datasets_from_db, get_connection
 from core.exporter import export_to_excel
-from ui.auth import is_owner, get_session_id
+from ui.auth import is_owner, get_session_id, can_query, record_query
+from ui.service_status import render_service_unavailable
 
 
 def _nl_to_sql_where(nl: str, columns: list[str], table: str) -> str:
     """Convert plain-English filter to a SQL WHERE clause via LLM."""
     import os, json
     from langchain_openai import ChatOpenAI
+    if not can_query():
+        raise PermissionError("AI filters are unavailable: usage could not be checked or the daily limit was reached.")
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0,
                      api_key=os.getenv("OPENAI_API_KEY", ""))
     cols_hint = ", ".join(columns[:30])
@@ -20,7 +23,10 @@ def _nl_to_sql_where(nl: str, columns: list[str], table: str) -> str:
         f"just the condition). Return ONLY the SQL condition, nothing else.\n"
         f"Filter: {nl}"
     )
-    resp = llm.invoke(prompt)
+    try:
+        resp = llm.invoke(prompt)
+    finally:
+        record_query()
     clause = resp.content.strip().strip(";").strip()
     # Safety: reject anything with DML/DDL
     if any(kw in clause.upper() for kw in
@@ -38,7 +44,7 @@ def render_explorer_tab():
             session_id=get_session_id(),
         )
     except Exception as e:
-        st.error(f"Could not load datasets: {e}")
+        render_service_unavailable("Dataset", "explorer", e)
         return
 
     if not datasets:
