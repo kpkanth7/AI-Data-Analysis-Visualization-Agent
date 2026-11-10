@@ -106,4 +106,4 @@ def load_demo_data():
 if __name__ == "__main__":
     create_tables()
     load_demo_data()
-    print("\nSetup complete. Run: streamlit run app.py")
+    print("\nSetup complete. Run: streamlit run legacy_app.py")

@@ -1,6 +1,6 @@
 # Data Analysis Agent
 
-**Live demo:** (https://ai-data-analysis-visualization-agent.streamlit.app/)
+The [hosted demo](https://ai-data-analysis-visualization-agent.streamlit.app/) requires Streamlit access. It offers Explorer and Chat previews and row counts for the three curated datasets. The full local app described below runs with `streamlit run legacy_app.py`.
 
 A natural-language data analyst in your browser. Drop a CSV, ask a question in plain English, get back SQL, charts, and a clean answer. Full session history, structured PDF reports, and a multi-step cleaning wizard that handles the gross parts of real-world data for you.
 
@@ -125,7 +125,7 @@ A few things I took seriously, even though it's a personal project.
 
 **Rate limiting.** Guest queries get counted in Postgres against the IP hash and today's UTC date. Same hash gets used for upload counters too, though those aren't capped (the concurrent file + per-file size cap is enough). A small dev script (`scripts/reset_guest_limit.py`) lets me wipe usage rows during testing.
 
-**Data retention.** Guest datasets have a hard 24-hour TTL via `cleanup_old_guest_datasets`. The cleanup runs once per UTC day at the first user interaction past midnight. When you delete a dataset, the dataset row, the underlying Postgres table, and all related Chroma embeddings get purged together. No orphan path that I'm aware of.
+**Local guest data retention.** A rendered Streamlit session attempts cleanup of guest uploads older than 24 hours once per UTC day. Database table removal and Chroma cleanup run separately, and errors can leave data behind.
 
 **No secrets in the repo.** API keys go in `.env` (gitignored), the owner password goes in `.streamlit/secrets.toml` (also gitignored). The repo ships an `.env.example` so you know what's needed.
 
@@ -140,7 +140,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # then fill in OPENAI_API_KEY and DATABASE_URL
 python -m scripts.setup_db  # creates tables, loads demo datasets
-streamlit run app.py
+streamlit run legacy_app.py
 ```
 
 Use `postgresql+psycopg2://...` for `DATABASE_URL`. Bare PostgreSQL URLs use the same driver. To check installed versions and the configured driver without connecting, run `python -m scripts.check_db_runtime`.

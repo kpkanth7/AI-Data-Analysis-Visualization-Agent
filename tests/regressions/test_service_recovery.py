@@ -9,7 +9,7 @@ from streamlit.testing.v1 import AppTest
 from ui import auth, chat, data_tab, explorer, topbar, history
 
 
-APP_PATH = Path(__file__).resolve().parents[2] / "app.py"
+APP_PATH = Path(__file__).resolve().parents[2] / "legacy_app.py"
 CHAT_APP = """
 from ui.auth import init_session_state
 from ui.chat import render_chat_tab
