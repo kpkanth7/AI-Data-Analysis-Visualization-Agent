@@ -173,7 +173,8 @@ def test_signin_entry_authenticates_and_clears_password(monkeypatch, services, e
     assert not app.exception
     assert app.session_state["is_owner"]
     assert any("No sessions saved yet" in item.value for item in app.info)
-    assert app.session_state.filtered_state.get(f"{entry}_owner_pw", "") == ""
+    password_key = f"{entry}_owner_pw"
+    assert password_key not in app.session_state or app.session_state[password_key] == ""
 
 
 def test_chat_empty_state_has_grounded_context_and_enabled_composer(services):

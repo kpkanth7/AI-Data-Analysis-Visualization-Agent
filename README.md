@@ -147,6 +147,19 @@ Use `postgresql+psycopg2://...` for `DATABASE_URL`. Bare PostgreSQL URLs use the
 
 For owner access, add `owner_password = "yourpassword"` to `.streamlit/secrets.toml`.
 
+## Private workspace pilot
+
+Run the pilot from the repository root after provisioning its PostgreSQL registry and workspace roles. Use the commented settings in [the Streamlit secrets example](.streamlit/secrets.toml.example) for a default OIDC provider, its expected issuer, and the three scoped database URLs. Install the dependencies from `requirements.txt`, which pins Streamlit and Authlib for the pilot. The provider's allowed callback must match the configured `/oauth2callback` URL. [Streamlit authentication setup](https://docs.streamlit.io/develop/concepts/connections/authentication)
+
+```bash
+python -m streamlit run private_pilot_app.py
+python -m pytest -q tests/test_workspace_pilot.py
+```
+
+The pilot test provisions its own disposable PostgreSQL database and verifies the role grants, credential rotation, and rollback. Runtime URLs use `postgresql+psycopg2`. Use `sslmode=verify-full` for a remote database and add the trusted CA with `sslrootcert` when needed. Keep operator credentials outside the app. Only members granted access to a configured workspace can use the pilot.
+
+The hosted entry point serves the curated demo until the operator sets `private_pilot.enabled = true` after verifying the hosted pilot configuration. Set it to `false` to restore the demo entry point.
+
 ## Tests
 
 ```bash
