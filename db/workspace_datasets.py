@@ -1,7 +1,8 @@
 """Private dataset lifecycle for a server-authorized workspace."""
 
 import csv
-from collections.abc import Callable, Iterator
+import json
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -13,10 +14,10 @@ from uuid import UUID, uuid4
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
-    Column, Date, Float, Integer, LargeBinary, MetaData, Numeric, Table, Text,
+    Column, Date, Float, ForeignKey, Integer, LargeBinary, MetaData, Numeric, Table, Text,
     delete, func, insert, inspect, literal, or_, select, text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import NoSuchTableError, ProgrammingError
 from sqlalchemy.types import Uuid
@@ -40,12 +41,53 @@ class UploadRequestConflict(ValueError):
     pass
 
 
+class CleaningPreviewChanged(ValueError):
+    pass
+
+
 def _csv_cell(value):
     if isinstance(value, str) and (
         value.startswith(("\t", "\r", "\n")) or value.lstrip().startswith(("=", "+", "-", "@"))
     ):
         return "'" + value
     return value
+
+
+def _csv_bytes(columns: Iterable[str], rows: Iterable[Iterable[object]]) -> bytes:
+    output = StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow([_csv_cell(name) for name in columns])
+    writer.writerows([_csv_cell(value) for value in row] for row in rows)
+    return output.getvalue().encode("utf-8-sig")
+
+
+def _load_csv(contents: bytes) -> pd.DataFrame:
+    decoded = contents.decode("utf-8-sig")
+    if "\x00" in decoded:
+        raise ValueError("CSV contains a NUL character.")
+    try:
+        records = csv.reader(StringIO(decoded, newline=""), strict=True)
+        header = next((row for row in records if row), [])
+        if (
+            not 1 <= len(header) <= MAX_UPLOAD_COLUMNS
+            or len(set(header)) != len(header)
+            or any(not name.strip() for name in header)
+        ):
+            raise ValueError("CSV requires distinct, nonempty column names within the column limit.")
+        row_count = 0
+        for row in records:
+            if not row:
+                continue
+            row_count += 1
+            if len(row) != len(header) or row_count > MAX_UPLOAD_ROWS:
+                raise ValueError("CSV rows must match the header and stay within the row limit.")
+    except csv.Error as exc:
+        raise ValueError("CSV contains an invalid or oversized field.") from exc
+
+    frame = pd.read_csv(BytesIO(contents), nrows=MAX_UPLOAD_ROWS + 1, compression=None)
+    if list(frame.columns) != header or len(frame) != row_count:
+        raise ValueError("CSV structure could not be read consistently.")
+    return frame
 
 
 @dataclass(frozen=True)
@@ -75,6 +117,39 @@ class WorkspaceRowCount(BaseModel):
 
 class WorkspaceColumnSummary(WorkspaceRowCount):
     column: Annotated[str, Field(min_length=1, max_length=63)]
+
+
+class WorkspaceTrimWhitespace(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    version_id: UUID
+    column: Annotated[str, Field(min_length=1, max_length=63)]
+
+
+@dataclass(frozen=True)
+class WorkspaceCleaningPreview:
+    plan: WorkspaceTrimWhitespace
+    access: WorkspaceAccess
+    fingerprint: str
+    row_count: int
+    changed_count: int
+    rows: tuple[tuple[object, object], ...]
+
+
+@dataclass(frozen=True)
+class WorkspaceAnalysis:
+    result_id: UUID
+    access: WorkspaceAccess
+    request: WorkspaceRowCount
+    values: dict[str, int | float | Decimal | None]
+
+
+@dataclass(frozen=True)
+class WorkspaceCSV:
+    version_id: UUID
+    data: bytes
+    row_count: int
+    truncated: bool
 
 
 def version_catalog(schema: str) -> Table:
@@ -108,6 +183,27 @@ def create_upload_receipts(connection: Connection, workspace_id: UUID) -> None:
     connection.exec_driver_sql(f"GRANT SELECT, INSERT ON {schema}.upload_receipts TO {schema}_writer")
 
 
+def _analysis_results(schema: str) -> Table:
+    return Table(
+        "analysis_results", MetaData(),
+        Column("result_id", Uuid, primary_key=True),
+        Column("version_id", Uuid, ForeignKey(version_catalog(schema).c.version_id, ondelete="CASCADE"),
+               nullable=False, index=True),
+        Column("principal_id", Text, nullable=False),
+        Column("column_name", Text),
+        Column("metrics", JSONB, nullable=False),
+        schema=schema,
+    )
+
+
+def create_analysis_results(connection: Connection, workspace_id: UUID) -> None:
+    """Provision saved results for an existing workspace using its operator connection."""
+    schema = f"w_{workspace_id.hex}"
+    _analysis_results(schema).create(connection, checkfirst=True)
+    connection.exec_driver_sql(f"GRANT SELECT ON {schema}.analysis_results TO {schema}_reader")
+    connection.exec_driver_sql(f"GRANT SELECT, INSERT ON {schema}.analysis_results TO {schema}_writer")
+
+
 class WorkspaceDatasets:
     def __init__(
         self,
@@ -123,6 +219,7 @@ class WorkspaceDatasets:
         self._schema = f"w_{access.workspace_id.hex}"
         self._catalog = version_catalog(self._schema)
         self._receipts = _upload_receipts(self._schema)
+        self._results = _analysis_results(self._schema)
 
     def _check_access(self, *, write: bool) -> None:
         if self._resolve_access() != self._access or (write and not self._access.can_manage):
@@ -151,19 +248,19 @@ class WorkspaceDatasets:
             yield connection
 
     def upload(self, frame: pd.DataFrame, filename: str) -> WorkspaceDataset:
-        return self._publish_upload(lambda: frame, filename, uuid4(), None)
+        return self._publish_version(lambda connection: self._store_upload(connection, frame, filename), uuid4(), None)
 
     def upload_csv(self, contents: bytes, filename: str, request_id: UUID) -> WorkspaceDataset:
         if not contents or len(contents) > MAX_CSV_BYTES or "\x00" in filename:
             raise ValueError("Choose a valid CSV file up to 1 MB.")
         digest = sha256(filename.encode("utf-8") + b"\x00" + contents).digest()
-        return self._publish_upload(
-            lambda: pd.read_csv(BytesIO(contents), nrows=MAX_UPLOAD_ROWS + 1, compression=None),
-            filename, request_id, digest,
+        return self._publish_version(
+            lambda connection: self._store_upload(connection, _load_csv(contents), filename),
+            request_id, digest,
         )
 
-    def _publish_upload(
-        self, load_frame: Callable[[], pd.DataFrame], filename: str,
+    def _publish_version(
+        self, publish: Callable[[Connection], WorkspaceDataset],
         request_id: UUID, fingerprint: bytes | None,
     ) -> WorkspaceDataset:
         receipts = self._receipts.c
@@ -192,7 +289,7 @@ class WorkspaceDatasets:
             if used >= WORKSPACE_UPLOADS_PER_DAY:
                 raise UploadLimitReached("This workspace has reached its daily upload limit.")
 
-            dataset = self._store_upload(connection, load_frame(), filename)
+            dataset = publish(connection)
             connection.execute(insert(self._receipts).values(
                 principal_id=self._access.principal_id, request_id=request_id, fingerprint=fingerprint,
                 version_id=dataset.version_id, admitted_on=day,
@@ -214,12 +311,16 @@ class WorkspaceDatasets:
         frame.reset_index(drop=True).to_sql(
             table_name, connection, schema=self._schema, if_exists="fail", index_label=ROW_KEY,
         )
+        self._register_version(connection, dataset)
+        return dataset
+
+    def _register_version(self, connection: Connection, dataset: WorkspaceDataset) -> None:
+        table_name = f"v_{dataset.version_id.hex}"
         connection.exec_driver_sql(f"GRANT SELECT ON {self._schema}.{table_name} TO {self._schema}_reader")
         connection.execute(insert(self._catalog).values(
             version_id=dataset.version_id, dataset_id=dataset.dataset_id,
-            filename=dataset.filename, row_count=dataset.row_count, columns=list(columns),
+            filename=dataset.filename, row_count=dataset.row_count, columns=list(dataset.columns),
         ))
-        return dataset
 
     def _metadata(self, connection: Connection, version_id: UUID) -> WorkspaceDataset:
         row = connection.execute(
@@ -253,7 +354,7 @@ class WorkspaceDatasets:
         with self._transaction() as connection:
             return self._metadata(connection, version_id)
 
-    def summarize(self, request: WorkspaceRowCount) -> dict[str, int | float | Decimal | None]:
+    def summarize(self, request: WorkspaceRowCount) -> WorkspaceAnalysis:
         """Compute one aggregate result over a bounded, authorized version."""
         with self._read_version(request.version_id) as (connection, dataset, relation):
             aggregates = [func.count().label("row_count")]
@@ -280,24 +381,180 @@ class WorkspaceDatasets:
             result = connection.execute(select(*aggregates).select_from(source)).mappings().one()
             if result["row_count"] > MAX_UPLOAD_ROWS:
                 raise ValueError("This dataset exceeds the analysis row limit.")
-            return dict(result)
+            return WorkspaceAnalysis(result_id=uuid4(), access=self._access, request=request, values=dict(result))
+
+    def analysis_csv(self, result: WorkspaceAnalysis) -> bytes:
+        """Reauthorize an executed session result and serialize its original values."""
+        if result.access != self._access:
+            raise PermissionError("This analysis result is unavailable.")
+        dataset = self.metadata(result.request.version_id)
+        column = None
+        operation = "count_rows"
+        if isinstance(result.request, WorkspaceColumnSummary):
+            column = result.request.column
+            operation = "summarize_column"
+        return _csv_bytes(
+            ("result_id", "version_id", "operation", "column", "metric", "value"),
+            (
+                (result.result_id, dataset.version_id, operation, column, metric, value)
+                for metric, value in result.values.items()
+            ),
+        )
+
+    def save_analysis(self, result: WorkspaceAnalysis) -> None:
+        """Save the exact session result once, under its originating principal."""
+        if result.access != self._access:
+            raise PermissionError("This analysis result is unavailable.")
+        column = result.request.column if isinstance(result.request, WorkspaceColumnSummary) else None
+        metrics = [
+            [key, type(value).__name__, str(value)] if value is not None else [key, None, None]
+            for key, value in result.values.items()
+        ]
+        version_id = result.request.version_id
+        with self._transaction(write=True) as connection:
+            self._metadata(connection, version_id)
+            saved = connection.execute(
+                pg_insert(self._results).values(
+                    result_id=result.result_id, version_id=version_id, principal_id=self._access.principal_id,
+                    column_name=column, metrics=metrics,
+                ).on_conflict_do_nothing(index_elements=[self._results.c.result_id])
+            )
+            if saved.rowcount == 0:
+                prior = self._saved_analysis(connection, version_id, result.result_id)
+                if prior.column_name != column or prior.metrics != metrics:
+                    raise PermissionError("This analysis result is unavailable.")
+
+    def _saved_analysis(self, connection: Connection, version_id: UUID, result_id: UUID):
+        results = self._results.c
+        row = connection.execute(select(self._results).where(
+            results.result_id == result_id,
+            results.version_id == version_id,
+            results.principal_id == self._access.principal_id,
+        )).one_or_none()
+        if row is None:
+            raise PermissionError("This saved analysis result is unavailable.")
+        return row
+
+    def restore_analysis(self, version_id: UUID, result_id: UUID) -> WorkspaceAnalysis:
+        """Restore the principal's saved result into their current authorized session."""
+        with self._transaction() as connection:
+            row = self._saved_analysis(connection, version_id, result_id)
+        request = WorkspaceRowCount(version_id=version_id)
+        if row.column_name is not None:
+            request = WorkspaceColumnSummary(version_id=version_id, column=row.column_name)
+        types = {"int": int, "float": float, "Decimal": Decimal}
+        values = {key: types[kind](value) if kind is not None else None for key, kind, value in row.metrics}
+        return WorkspaceAnalysis(result_id=result_id, access=self._access, request=request, values=values)
+
+    def preview_cleaning(self, plan: WorkspaceTrimWhitespace) -> WorkspaceCleaningPreview:
+        """Evaluate one typed cleaning operation against the authorized source."""
+        with self._read_version(plan.version_id) as (connection, dataset, relation):
+            if plan.column not in dataset.columns:
+                raise PermissionError("This dataset column is unavailable.")
+            statement = select(relation.c[plan.column]).order_by(relation.c[ROW_KEY]).limit(MAX_UPLOAD_ROWS + 1)
+            values = connection.scalars(statement).all()
+        preview, _ = self._evaluate_trim(plan, values)
+        return preview
+
+    def _evaluate_trim(
+        self, plan: WorkspaceTrimWhitespace, values: list,
+    ) -> tuple[WorkspaceCleaningPreview, list]:
+        if len(values) > MAX_UPLOAD_ROWS:
+            raise ValueError("This dataset exceeds the cleaning preview row limit.")
+
+        changed_count = 0
+        preview = []
+        trimmed = []
+        fingerprint = sha256(plan.model_dump_json().encode("utf-8"))
+        for index, before in enumerate(values):
+            after = before.strip() if isinstance(before, str) else before
+            trimmed.append(after)
+            changed_count += isinstance(before, str) and before != after
+            fingerprint.update(json.dumps((type(before).__name__, repr(before), repr(after))).encode("ascii"))
+            if index < PREVIEW_ROWS:
+                preview.append((before, after))
+        result = WorkspaceCleaningPreview(
+            plan, self._access, fingerprint.hexdigest(), len(values), changed_count, tuple(preview),
+        )
+        return result, trimmed
+
+    def replay_cleaning(self, approved: WorkspaceCleaningPreview) -> WorkspaceCleaningPreview:
+        """Verify the manager-reviewed operation in the same authorized session."""
+        self._check_cleaning_access(approved)
+        replayed = self.preview_cleaning(approved.plan)
+        self._check_cleaning_fingerprint(approved, replayed)
+        return replayed
+
+    def _check_cleaning_access(self, approved: WorkspaceCleaningPreview) -> None:
+        self._check_access(write=True)
+        if approved.access != self._access:
+            raise PermissionError("This cleaning preview is unavailable.")
+
+    @staticmethod
+    def _check_cleaning_fingerprint(approved: WorkspaceCleaningPreview, current: WorkspaceCleaningPreview) -> None:
+        if current.fingerprint != approved.fingerprint:
+            raise CleaningPreviewChanged("The column values changed. Generate a new cleaning preview.")
+
+    def publish_cleaning(self, approved: WorkspaceCleaningPreview, request_id: UUID) -> WorkspaceDataset:
+        """Publish the reviewed trim as a sibling version using the existing upload receipt."""
+        self._check_cleaning_access(approved)
+        fingerprint = sha256(f"cleaning:{approved.fingerprint}".encode("ascii")).digest()
+        return self._publish_version(
+            lambda connection: self._store_cleaned_version(connection, approved), request_id, fingerprint,
+        )
+
+    def _store_cleaned_version(self, connection: Connection, approved: WorkspaceCleaningPreview) -> WorkspaceDataset:
+        plan = approved.plan
+        with self._version_relation(connection, plan.version_id) as (source, relation):
+            if plan.column not in source.columns:
+                raise PermissionError("This dataset column is unavailable.")
+            statement = select(relation).order_by(relation.c[ROW_KEY]).limit(MAX_UPLOAD_ROWS + 1)
+            rows = [dict(row) for row in connection.execute(statement).mappings()]
+            replayed, trimmed = self._evaluate_trim(plan, [row[plan.column] for row in rows])
+            self._check_cleaning_fingerprint(approved, replayed)
+            for row, value in zip(rows, trimmed, strict=True):
+                row[plan.column] = value
+
+            self._check_access(write=True)
+            dataset = WorkspaceDataset(source.dataset_id, uuid4(), source.filename, len(rows), source.columns)
+            table_name = f"v_{dataset.version_id.hex}"
+            connection.exec_driver_sql(
+                f"CREATE TABLE {self._schema}.{table_name} (LIKE {self._schema}.{relation.name} INCLUDING INDEXES)"
+            )
+            if rows:
+                target = Table(table_name, MetaData(), *(Column(name) for name in relation.c.keys()), schema=self._schema)
+                connection.execute(insert(target), rows)
+            self._register_version(connection, dataset)
+            return dataset
 
     def preview(self, version_id: UUID, limit: int = PREVIEW_ROWS) -> list[dict]:
-        _, rows = self._read_preview(version_id, limit)
-        return rows
-
-    def preview_csv(self, version_id: UUID) -> bytes:
-        """Resolve a fresh authorized preview and serialize it without a server file."""
-        dataset, rows = self._read_preview(version_id, PREVIEW_ROWS)
-        output = StringIO(newline="")
-        writer = csv.writer(output)
-        writer.writerow([_csv_cell(name) for name in dataset.columns])
-        writer.writerows([_csv_cell(row[name]) for name in dataset.columns] for row in rows)
-        return output.getvalue().encode("utf-8-sig")
-
-    def _read_preview(self, version_id: UUID, limit: int) -> tuple[WorkspaceDataset, list[dict]]:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("Preview limit must be between 1 and 100.")
+        _, rows = self._read_rows(version_id, limit)
+        return rows
+
+    def preview_csv(self, version_id: UUID) -> WorkspaceCSV:
+        """Resolve a fresh authorized preview and serialize it without a server file."""
+        dataset, rows = self._read_rows(version_id, PREVIEW_ROWS + 1)
+        return self._serialize_csv(dataset, rows[:PREVIEW_ROWS], truncated=len(rows) > PREVIEW_ROWS)
+
+    def full_csv(self, version_id: UUID) -> WorkspaceCSV:
+        """Export every row of a fresh authorized version within the pilot row limit."""
+        dataset, rows = self._read_rows(version_id, MAX_UPLOAD_ROWS + 1)
+        if len(rows) > MAX_UPLOAD_ROWS:
+            raise ValueError("This dataset exceeds the full CSV row limit.")
+        return self._serialize_csv(dataset, rows, truncated=False)
+
+    @staticmethod
+    def _serialize_csv(dataset: WorkspaceDataset, rows: list[dict], *, truncated: bool) -> WorkspaceCSV:
+        return WorkspaceCSV(
+            version_id=dataset.version_id,
+            data=_csv_bytes(dataset.columns, ([row[name] for name in dataset.columns] for row in rows)),
+            row_count=len(rows),
+            truncated=truncated,
+        )
+
+    def _read_rows(self, version_id: UUID, limit: int) -> tuple[WorkspaceDataset, list[dict]]:
         with self._read_version(version_id) as (connection, dataset, relation):
             statement = select(*(relation.c[name] for name in dataset.columns)).order_by(relation.c[ROW_KEY]).limit(limit)
             return dataset, [dict(row) for row in connection.execute(statement).mappings()]
@@ -305,20 +562,25 @@ class WorkspaceDatasets:
     @contextmanager
     def _read_version(self, version_id: UUID) -> Iterator[tuple[Connection, WorkspaceDataset, Table]]:
         with self._transaction() as connection:
-            dataset = self._metadata(connection, version_id)
-            relation = Table(
-                f"v_{dataset.version_id.hex}", MetaData(),
-                *(Column(name) for name in (*dataset.columns, ROW_KEY)), schema=self._schema,
-            )
-            try:
+            with self._version_relation(connection, version_id) as (dataset, relation):
                 yield connection, dataset, relation
-            except NoSuchTableError:
-                raise PermissionError("This dataset version is unavailable.") from None
-            except ProgrammingError as exc:
-                if getattr(exc.orig, "pgcode", None) != "42P01":
-                    raise
-                # Deletion may commit after the catalog lookup and before the read.
-                raise PermissionError("This dataset version is unavailable.") from None
+
+    @contextmanager
+    def _version_relation(self, connection: Connection, version_id: UUID) -> Iterator[tuple[WorkspaceDataset, Table]]:
+        dataset = self._metadata(connection, version_id)
+        relation = Table(
+            f"v_{dataset.version_id.hex}", MetaData(),
+            *(Column(name) for name in (*dataset.columns, ROW_KEY)), schema=self._schema,
+        )
+        try:
+            yield dataset, relation
+        except NoSuchTableError:
+            raise PermissionError("This dataset version is unavailable.") from None
+        except ProgrammingError as exc:
+            if getattr(exc.orig, "pgcode", None) != "42P01":
+                raise
+            # Deletion may commit after the catalog lookup and before the read.
+            raise PermissionError("This dataset version is unavailable.") from None
 
     def delete(self, version_id: UUID) -> None:
         with self._transaction(write=True) as connection:

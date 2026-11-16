@@ -17,7 +17,9 @@ from sqlalchemy.pool import NullPool
 from streamlit.testing.v1 import AppTest
 
 from db.demo_catalog import DEMO_READER
-from db.workspace_datasets import WorkspaceAccess, WorkspaceDatasets, create_upload_receipts, version_catalog
+from db.workspace_datasets import (
+    WorkspaceAccess, WorkspaceDatasets, create_analysis_results, create_upload_receipts, version_catalog,
+)
 from db.workspace_memberships import (
     MEMBERSHIP_READER, MembershipRegistry, create_membership_registry, grant_membership, revoke_membership,
 )
@@ -102,7 +104,7 @@ def test_pilot_requires_explicit_scoped_credentials(monkeypatch):
         assert "sentinel" not in app.error[0].value
 
 
-def test_pilot_scram_rotation_and_demo_rollback(scram_postgres_owner, monkeypatch):
+def test_pilot_scram_rotation_and_demo_rollback(scram_postgres_owner, monkeypatch, synthetic_demo_files):
     owner = scram_postgres_owner
     workspace_id = uuid4()
     schema = f"w_{workspace_id.hex}"
@@ -126,6 +128,21 @@ def test_pilot_scram_rotation_and_demo_rollback(scram_postgres_owner, monkeypatc
         old = {role: connect_as(role, passwords[role]) for role in pilot_roles}
         demo = connect_as(DEMO_READER, passwords[DEMO_READER])
 
+        def guarded_demo():
+            app = AppTest.from_file(str(_PILOT_APP))
+            app.secrets["private_pilot"] = {"enabled": False}
+            app.secrets["demo_reader"] = {"url": demo.url.render_as_string(hide_password=False)}
+            app.run(timeout=15)
+            assert not app.exception and not app.error
+            assert [tab.label for tab in app.tabs] == ["Explorer", "Chat"]
+            assert app.caption[0].value == "891 matching rows"
+            assert not app.get("file_uploader")
+
+        guarded_demo()
+        with owner.begin() as connection:
+            create_analysis_results(connection, workspace_id)
+        guarded_demo()
+
         def workspace_app(engines):
             app = AppTest.from_file(str(_PILOT_APP))
             app.secrets["auth"] = _TEST_AUTH
@@ -147,7 +164,7 @@ def test_pilot_scram_rotation_and_demo_rollback(scram_postgres_owner, monkeypatc
         private_table = f"{schema}.v_{dataset.version_id.hex}"
         before = workspace_app(old)
         assert not before.exception
-        before.selectbox[0].set_value(f"{dataset.filename} · {dataset.version_id}").run()
+        before.selectbox[0].set_value(dataset.version_id).run()
         assert "<td>17</td>" in before.get("html")[0].proto.body
 
         for engine, statement in (
@@ -156,6 +173,9 @@ def test_pilot_scram_rotation_and_demo_rollback(scram_postgres_owner, monkeypatc
             (old[writer_role], "SELECT * FROM workspace_auth.memberships"),
             (old[writer_role], "SELECT * FROM public.pilot_legacy_sample"),
             (demo, f"SELECT * FROM {private_table}"),
+            (demo, f"SELECT * FROM {schema}.analysis_results"),
+            (old[MEMBERSHIP_READER], f"SELECT * FROM {schema}.analysis_results"),
+            (old[reader_role], f"INSERT INTO {schema}.analysis_results DEFAULT VALUES"),
         ):
             with engine.connect() as connection, pytest.raises(ProgrammingError) as denied:
                 connection.exec_driver_sql(statement)
@@ -188,16 +208,37 @@ def test_pilot_scram_rotation_and_demo_rollback(scram_postgres_owner, monkeypatc
         fresh = {role: connect_as(role, password) for role, password in rotated.items()}
         after = workspace_app(fresh)
         assert not after.exception and not after.error
-        after.selectbox[0].set_value(f"{dataset.filename} · {dataset.version_id}").run()
+        after.selectbox[0].set_value(dataset.version_id).run()
         assert "<td>17</td>" in after.get("html")[0].proto.body
         rotated_service = WorkspaceDatasets(access, lambda: access, fresh[reader_role], fresh[writer_role])
         probe = rotated_service.upload(pd.DataFrame({"value": [18]}), "rotation-probe.csv")
         rotated_service.delete(probe.version_id)
 
+        second_session = workspace_app(fresh)
+        second_session.selectbox[0].set_value(dataset.version_id).run()
+        assert "<td>17</td>" in second_session.get("html")[0].proto.body
+        next(button for button in after.button if button.label == "Run analysis").click().run()
+        original_csv, = after.get("iframe")
+        original_payload = original_csv.proto.srcdoc
+        next(button for button in after.button if button.label == "Save result").click().run()
+        assert not after.exception
+        result_id = UUID(after.success[0].value.removeprefix("Saved analysis result ").removesuffix("."))
+        assert after.get("iframe")[0].proto.srcdoc == original_payload
+        next(button for button in second_session.button if button.label == "Prepare preview CSV").click().run()
+        assert second_session.get("iframe")
+
+        with owner.begin() as connection:
+            revoke_membership(connection, *identity)
+        for open_session in (after, second_session):
+            open_session.run()
+            assert not open_session.exception and not open_session.error
+            assert not open_session.selectbox and not open_session.get("file_uploader")
+            assert not open_session.get("html") and not open_session.get("iframe")
+            assert any("account that has workspace access" in item.value for item in open_session.info)
+
         rollback_session = stack.enter_context(fresh[writer_role].connect())
         rollback_pid = rollback_session.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
         with owner.begin() as connection:
-            revoke_membership(connection, *identity)
             for role in pilot_roles:
                 connection.exec_driver_sql(f"ALTER ROLE {role} NOLOGIN")
         assert _drain(owner, pilot_roles) == {rollback_pid}
@@ -208,14 +249,26 @@ def test_pilot_scram_rotation_and_demo_rollback(scram_postgres_owner, monkeypatc
                 engine.connect()
         assert demo_session.exec_driver_sql(demo_count).scalar_one() == 891
 
-        demo_app = AppTest.from_file(str(_PILOT_APP))
-        demo_app.secrets["private_pilot"] = {"enabled": False}
-        demo_app.secrets["demo_reader"] = {"url": demo.url.render_as_string(hide_password=False)}
-        demo_app.run(timeout=15)
-        assert not demo_app.exception and not demo_app.error
-        assert [tab.label for tab in demo_app.tabs] == ["Explorer", "Chat"]
-        assert demo_app.caption[0].value == "891 matching rows"
+        guarded_demo()
         with owner.connect() as connection:
             assert connection.exec_driver_sql(f"SELECT value FROM {private_table}").scalar_one() == 17
             assert connection.exec_driver_sql("SELECT id FROM public.pilot_legacy_sample").scalar_one() == 42
             assert connection.exec_driver_sql("SELECT active FROM workspace_auth.memberships").scalar_one() is False
+            saved = connection.exec_driver_sql(
+                f"SELECT result_id, version_id FROM {schema}.analysis_results"
+            ).one()
+            assert saved == (result_id, dataset.version_id)
+
+        with owner.begin() as connection:
+            for role in pilot_roles:
+                connection.exec_driver_sql(f"ALTER ROLE {role} LOGIN")
+            grant_membership(connection, *identity, workspace_id, can_manage=False)
+        recovered = workspace_app(fresh)
+        assert not recovered.exception and not recovered.error
+        recovered.selectbox[0].set_value(dataset.version_id).run()
+        next(widget for widget in recovered.text_input if widget.label == "Saved result ID").set_value(str(result_id))
+        next(button for button in recovered.button if button.label == "Restore result").click().run()
+        assert not recovered.exception and not recovered.error
+        assert [item.value for item in recovered.text] == ["Rows: 1"]
+        assert recovered.get("iframe")[0].proto.srcdoc == original_payload
+        guarded_demo()

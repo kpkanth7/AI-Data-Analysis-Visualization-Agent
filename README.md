@@ -158,6 +158,10 @@ python -m pytest -q tests/test_workspace_pilot.py
 
 The pilot test provisions its own disposable PostgreSQL database and verifies the role grants, credential rotation, and rollback. Runtime URLs use `postgresql+psycopg2`. Use `sslmode=verify-full` for a remote database and add the trusted CA with `sslrootcert` when needed. Keep operator credentials outside the app. Only members granted access to a configured workspace can use the pilot.
 
+The pilot supports typed row counts and column summaries, preview and full dataset CSVs, and a whitespace trim that creates a new dataset version. Managers can save an analysis result and restore it by ID in an authorized session.
+
+To enable saved results for an existing workspace, run `db.workspace_datasets.create_analysis_results(connection, workspace_id)` once in a PostgreSQL operator transaction before enabling the pilot. Use the existing scoped role names and workspace UUID. Deleting a source version removes its saved results.
+
 The hosted entry point serves the curated demo until the operator sets `private_pilot.enabled = true` after verifying the hosted pilot configuration. Set it to `false` to restore the demo entry point.
 
 ## Tests

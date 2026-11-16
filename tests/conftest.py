@@ -64,3 +64,25 @@ def _local_postgres(authentication):
                 [pg_ctl, "-D", str(cluster), "-m", "fast", "-w", "stop"],
                 check=True, capture_output=True, text=True, timeout=30,
             )
+
+
+@pytest.fixture(scope="module")
+def synthetic_demo_files(tmp_path_factory):
+    from db import demo_catalog
+    from scripts import stage_demo_catalog
+
+    directory = tmp_path_factory.mktemp("synthetic-demo-csv")
+    # Retain the row counts and filter inputs asserted by the release tests.
+    (directory / "titanic.csv").write_text(
+        "PassengerId,Name\n" + "".join(f"{index},Synthetic passenger {index}\n" for index in range(1, 892)),
+        encoding="utf-8",
+    )
+    for slug, rows in (("sp500_financials", 503), ("world_co2_emissions", 8617)):
+        (directory / f"{slug}.csv").write_text(
+            "SyntheticValue\n" + "".join(f"{index}\n" for index in range(1, rows + 1)),
+            encoding="utf-8",
+        )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(demo_catalog, "DEMO_DIR", directory)
+        patch.setattr(stage_demo_catalog, "DEMO_DIR", directory)
+        yield

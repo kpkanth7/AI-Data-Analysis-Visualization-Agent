@@ -26,7 +26,7 @@ DEMOS = {"titanic": 891, "sp500_financials": 503, "world_co2_emissions": 8617}
 
 
 @pytest.fixture(scope="module")
-def demo_postgres():
+def demo_postgres(synthetic_demo_files):
     initdb, pg_ctl = (shutil.which(name) for name in ("initdb", "pg_ctl"))
     if initdb is None or pg_ctl is None:
         pytest.skip("Local PostgreSQL initdb and pg_ctl are required")
