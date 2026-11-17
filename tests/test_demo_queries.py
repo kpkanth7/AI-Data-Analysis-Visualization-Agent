@@ -1,9 +1,12 @@
 """Run the demo readers against a fresh PostgreSQL cluster on a private socket."""
 
+import csv
 import shutil
 import subprocess
 import tempfile
+from base64 import b64decode
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,6 +26,11 @@ from scripts.stage_demo_catalog import grant_demo_access, revoke_demo_access, st
 
 APP_DIR = Path(__file__).resolve().parents[1]
 DEMOS = {"titanic": 891, "sp500_financials": 503, "world_co2_emissions": 8617}
+DEMO_BRIEFS = {
+    "titanic": "One row per passenger, with ticket, travel, and survival details.",
+    "sp500_financials": "One row per stock symbol, with company, sector, and financial metrics.",
+    "world_co2_emissions": "One row per country or region and year, with emissions and related indicators.",
+}
 
 
 @pytest.fixture(scope="module")
@@ -155,6 +163,13 @@ def _demo_tabs(queries):
     render_demo_explorer(queries)
 
 
+def _preview_csv(app, label):
+    frames = [item.proto.srcdoc for item in app.get("iframe")]
+    source, = [frame for frame in frames if f"Save {label}</a>" in frame]
+    encoded = source.split("base64,", 1)[1].split('"', 1)[0]
+    return list(csv.reader(StringIO(b64decode(encoded).decode("utf-8-sig"))))
+
+
 @pytest.mark.parametrize("demo", DEMOS)
 def test_chat_and_explorer_agree_on_demo_results(demo, demo_queries, monkeypatch):
     from ui import chat, explorer
@@ -173,13 +188,27 @@ def test_chat_and_explorer_agree_on_demo_results(demo, demo_queries, monkeypatch
     app.selectbox(key="demo_explorer_dataset").set_value(version.version_id)
     app.chat_input(key="demo_chat_input").set_value(f"How many rows are in {demo}?").run(timeout=15)
     assert not app.exception and not app.error
+    assert [item.label for item in app.expander] == [f"Columns ({len(version.columns)})"] * 2
+    markdown = [item.value for item in app.markdown]
+    assert markdown.count(DEMO_BRIEFS[demo]) == 2
+    assert markdown.count(", ".join(version.columns)) == 2
     assert f"{demo} has {DEMOS[demo]:,} rows." in [item.value for item in app.markdown]
+    assert any(
+        'role="status"' in item.value and f"{demo} has {DEMOS[demo]:,} rows." in item.value
+        for item in app.markdown
+    )
     assert f"{DEMOS[demo]:,} matching rows" in [item.value for item in app.caption]
 
     app.chat_input(key="demo_chat_input").set_value("preview").run(timeout=15)
     assert not app.exception and not app.error
     assert len(app.dataframe) == 2
+    assert any(
+        'role="status"' in item.value and f"Showing 10 rows from {demo}." in item.value
+        for item in app.markdown
+    )
     pd.testing.assert_frame_equal(app.dataframe[0].value, app.dataframe[1].value.head(10).reset_index(drop=True))
+    assert len(_preview_csv(app, "Preview CSV (10 rows)")) == 11
+    assert len(_preview_csv(app, "Preview CSV (50 rows)")) == 51
 
     if demo == "titanic":
         app.selectbox(key=f"demo_filter_{version.version_id}").set_value("PassengerId").run(timeout=15)
@@ -188,6 +217,49 @@ def test_chat_and_explorer_agree_on_demo_results(demo, demo_queries, monkeypatch
         assert not app.exception and not app.error
         assert [item.value for item in app.caption] == ["1 matching row"]
         assert app.dataframe[0].value["PassengerId"].tolist() == [891]
+        header, row = _preview_csv(app, "Preview CSV (1 row)")
+        assert header == list(version.columns)
+        assert row[header.index("PassengerId")] == "891"
+
+        app.text_input(key=value_key).set_value("0").run(timeout=15)
+        assert [item.value for item in app.caption] == ["0 matching rows"]
+        assert _preview_csv(app, "Preview CSV (0 rows)") == [header]
+
+
+def test_demo_chat_retries_only_on_request_and_discards_failure_on_dataset_change(demo_queries, monkeypatch):
+    attempts = []
+    execute = demo_queries.execute
+    fail_next = True
+
+    def execute_with_transient_failure(request):
+        nonlocal fail_next
+        if isinstance(request, DemoPreview) and request.limit == 10:
+            attempts.append(request)
+            if fail_next:
+                fail_next = False
+                raise ProgrammingError(None, None, RuntimeError("synthetic failure"))
+        return execute(request)
+
+    monkeypatch.setattr(demo_queries, "execute", execute_with_transient_failure)
+    app = AppTest.from_function(_demo_tabs, args=(demo_queries,)).run(timeout=15)
+    app.chat_input(key="demo_chat_input").set_value("preview").run()
+    assert len(attempts) == 1
+    assert app.error[0].value == "This question could not run. Please retry in a moment."
+    app.run()
+    assert len(attempts) == 1
+    app.button(key="demo_chat_retry").click().run()
+    assert attempts == [attempts[0], attempts[0]]
+    assert not app.exception and not app.error
+    assert len(app.dataframe[0].value) == 10
+
+    fail_next = True
+    app.chat_input(key="demo_chat_input").set_value("preview").run()
+    assert len(attempts) == 3
+    for version in (demo_queries.versions[1], demo_queries.versions[0]):
+        app.selectbox(key="demo_chat_dataset").set_value(version.version_id).run()
+        assert not app.exception and not app.error
+        assert not any(button.key == "demo_chat_retry" for button in app.button)
+        assert len(attempts) == 3
 
 
 def test_demo_cutover_and_rollback_preserve_legacy_data(demo_postgres, monkeypatch):
@@ -215,6 +287,8 @@ def test_demo_cutover_and_rollback_preserve_legacy_data(demo_postgres, monkeypat
     assert not demo.exception and not demo.error
     assert [tab.label for tab in demo.tabs] == ["Explorer", "Chat"]
     assert not demo.get("file_uploader") and not demo.get("download_button")
+    assert "Curated samples cannot be deleted." in [item.value for item in demo.caption]
+    assert len(_preview_csv(demo, "Preview CSV (50 rows)")) == 51
     assert "891 matching rows" in [item.value for item in demo.caption]
     demo.chat_input(key="demo_chat_input").set_value("How many rows are in titanic?").run(timeout=15)
     assert "titanic has 891 rows." in [item.value for item in demo.markdown]

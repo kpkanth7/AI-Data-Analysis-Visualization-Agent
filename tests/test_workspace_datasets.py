@@ -994,6 +994,9 @@ def test_pending_delete_cannot_survive_membership_change(
     next(button for button in app.button if button.label == "Prepare preview CSV").click().run()
     assert len(app.get("iframe")) == 1
     next(button for button in app.button if button.label == "Delete dataset").click().run()
+    assert "Delete this dataset version? This permanently removes its rows and saved analysis results." in [
+        warning.value for warning in app.warning
+    ]
     confirm = next(button for button in app.button if button.label == "Confirm deletion")
 
     with workspace_database.begin() as connection:

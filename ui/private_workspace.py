@@ -1,7 +1,6 @@
 """Streamlit flow for a verified identity and server-supplied workspace membership."""
 
 import time
-from base64 import b64encode
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
@@ -20,6 +19,7 @@ from db.workspace_datasets import (
     WorkspaceTrimWhitespace,
 )
 from db.workspace_memberships import WorkspaceMembership
+from ui.csv_download import render_csv_link
 from ui.service_status import render_service_unavailable
 
 
@@ -236,7 +236,7 @@ def _render_analysis(
             st.text(f"{labels[key]}: {value if value is not None else 'No values'}")
         _render_summary_chart(result)
         st.caption(f"Analysis CSV result: {result.result_id}")
-        _render_csv_link(csv_data, "Analysis CSV", "workspace-analysis.csv")
+        render_csv_link(csv_data, "Analysis CSV", "workspace-analysis.csv")
         if access.can_manage and not saved:
             st.button(
                 "Save result", key=f"{prefix}save_{result.result_id}", on_click=_save_analysis,
@@ -357,23 +357,7 @@ def _render_cleaning_preview(
 
 def _render_csv_download(export: WorkspaceCSV, label: str, filename: str, status: str) -> None:
     st.caption(f"{label}: {export.row_count} data rows ({status}). Version: {export.version_id}")
-    _render_csv_link(export.data, label, filename)
-
-
-def _render_csv_link(data: bytes, label: str, filename: str) -> None:
-    # Deliver the bytes to this authenticated Streamlit session without a media URL.
-    encoded = b64encode(data).decode("ascii")
-    markup = (
-        '<meta name="color-scheme" content="light dark">'
-        f'<a download="{filename}" href="data:text/csv;charset=utf-8;base64,'
-        f'{encoded}">Save {label}</a>'
-    )
-    if hasattr(st, "iframe"):
-        st.iframe(markup, height=30, alt=f"{label} download")
-    else:
-        from streamlit.components.v1 import html as iframe_html
-
-        iframe_html(markup, height=30)
+    render_csv_link(export.data, label, filename)
 
 
 def _render_datasets(service: WorkspaceDatasets, access: WorkspaceAccess, prefix: str) -> None:
@@ -446,7 +430,7 @@ def _render_datasets(service: WorkspaceDatasets, access: WorkspaceAccess, prefix
 
         st.button("Delete dataset", key=f"{prefix}request_{selection.hex}", on_click=request_deletion)
         if st.session_state.get(pending_key) == selection:
-            st.warning("Delete this dataset and its rows?")
+            st.warning("Delete this dataset version? This permanently removes its rows and saved analysis results.")
             if st.button("Cancel deletion", key=f"{prefix}cancel_{selection.hex}"):
                 del st.session_state[pending_key]
                 st.rerun()

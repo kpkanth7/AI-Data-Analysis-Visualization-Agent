@@ -135,7 +135,7 @@ def test_pilot_scram_rotation_and_demo_rollback(scram_postgres_owner, monkeypatc
             app.run(timeout=15)
             assert not app.exception and not app.error
             assert [tab.label for tab in app.tabs] == ["Explorer", "Chat"]
-            assert app.caption[0].value == "891 matching rows"
+            assert "891 matching rows" in [caption.value for caption in app.caption]
             assert not app.get("file_uploader")
 
         guarded_demo()

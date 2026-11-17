@@ -2,7 +2,7 @@
 
 import csv
 import json
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -21,6 +21,8 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import NoSuchTableError, ProgrammingError
 from sqlalchemy.types import Uuid
+
+from core.csv_export import csv_bytes
 
 
 ROW_KEY = "_workspace_row_id"
@@ -43,22 +45,6 @@ class UploadRequestConflict(ValueError):
 
 class CleaningPreviewChanged(ValueError):
     pass
-
-
-def _csv_cell(value):
-    if isinstance(value, str) and (
-        value.startswith(("\t", "\r", "\n")) or value.lstrip().startswith(("=", "+", "-", "@"))
-    ):
-        return "'" + value
-    return value
-
-
-def _csv_bytes(columns: Iterable[str], rows: Iterable[Iterable[object]]) -> bytes:
-    output = StringIO(newline="")
-    writer = csv.writer(output)
-    writer.writerow([_csv_cell(name) for name in columns])
-    writer.writerows([_csv_cell(value) for value in row] for row in rows)
-    return output.getvalue().encode("utf-8-sig")
 
 
 def _load_csv(contents: bytes) -> pd.DataFrame:
@@ -393,7 +379,7 @@ class WorkspaceDatasets:
         if isinstance(result.request, WorkspaceColumnSummary):
             column = result.request.column
             operation = "summarize_column"
-        return _csv_bytes(
+        return csv_bytes(
             ("result_id", "version_id", "operation", "column", "metric", "value"),
             (
                 (result.result_id, dataset.version_id, operation, column, metric, value)
@@ -549,7 +535,7 @@ class WorkspaceDatasets:
     def _serialize_csv(dataset: WorkspaceDataset, rows: list[dict], *, truncated: bool) -> WorkspaceCSV:
         return WorkspaceCSV(
             version_id=dataset.version_id,
-            data=_csv_bytes(dataset.columns, ([row[name] for name in dataset.columns] for row in rows)),
+            data=csv_bytes(dataset.columns, ([row[name] for name in dataset.columns] for row in rows)),
             row_count=len(rows),
             truncated=truncated,
         )
