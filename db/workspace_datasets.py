@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from io import BytesIO, StringIO
@@ -14,12 +15,13 @@ from uuid import UUID, uuid4
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
-    Column, Date, Float, ForeignKey, Integer, LargeBinary, MetaData, Numeric, Table, Text,
-    delete, func, insert, inspect, literal, or_, select, text,
+    Boolean, CheckConstraint, Column, Date, DateTime, Float, ForeignKey, Integer,
+    LargeBinary, MetaData, Numeric, Table, Text, delete, func, insert, inspect,
+    literal, or_, select, text, update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.exc import NoSuchTableError, ProgrammingError
+from sqlalchemy.exc import NoSuchTableError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.types import Uuid
 
 from core.csv_export import csv_bytes
@@ -33,6 +35,10 @@ MAX_UPLOAD_COLUMNS = 64
 PREVIEW_ROWS = 50
 CATALOG_SEARCH_MAX_CHARS = 128
 CATALOG_SEARCH_LIMIT = 50
+ANALYSIS_RUN_CALL_LIMIT = 4
+_ANALYSIS_RUN_POLICY = 1
+_ANALYSIS_RUN_RETENTION = timedelta(hours=24)
+_ANALYSIS_ATTEMPT_LEASE = timedelta(seconds=30)
 
 
 class UploadLimitReached(ValueError):
@@ -84,6 +90,7 @@ class WorkspaceAccess:
     session_id: UUID
     workspace_id: UUID
     can_manage: bool
+    membership_revision: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +135,37 @@ class WorkspaceAnalysis:
     access: WorkspaceAccess
     request: WorkspaceRowCount
     values: dict[str, int | float | Decimal | None]
+
+
+@dataclass(frozen=True)
+class WorkspaceAnalysisRun:
+    run_id: UUID
+    request: WorkspaceColumnSummary
+    expires_at: datetime
+    results: tuple[WorkspaceAnalysis, ...]
+    calls_used: int
+    in_progress: bool
+    last_attempt_failed: bool
+
+    @property
+    def complete(self) -> bool:
+        return len(self.results) == 2
+
+    @property
+    def calls_remaining(self) -> int:
+        return ANALYSIS_RUN_CALL_LIMIT - self.calls_used
+
+
+def _encode_metrics(result: WorkspaceAnalysis) -> list:
+    return [
+        [key, type(value).__name__, str(value)] if value is not None else [key, None, None]
+        for key, value in result.values.items()
+    ]
+
+
+def _decode_metrics(metrics: list) -> dict[str, int | float | Decimal | None]:
+    types = {"int": int, "float": float, "Decimal": Decimal}
+    return {key: types[kind](value) if kind is not None else None for key, kind, value in metrics}
 
 
 @dataclass(frozen=True)
@@ -190,6 +228,69 @@ def create_analysis_results(connection: Connection, workspace_id: UUID) -> None:
     connection.exec_driver_sql(f"GRANT SELECT, INSERT ON {schema}.analysis_results TO {schema}_writer")
 
 
+def _analysis_runs(schema: str) -> Table:
+    return Table(
+        "analysis_runs", MetaData(),
+        Column("run_id", Uuid, primary_key=True),
+        Column("version_id", Uuid, ForeignKey(version_catalog(schema).c.version_id, ondelete="CASCADE"),
+               nullable=False, index=True),
+        Column("principal_id", Text, nullable=False),
+        Column("membership_revision", Uuid, nullable=False),
+        Column("conversation_id", Uuid, nullable=False),
+        Column("policy_version", Integer, nullable=False),
+        Column("column_name", Text, nullable=False),
+        Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+        Column("attempt_ids", ARRAY(Uuid), nullable=False),
+        Column("lease_until", DateTime(timezone=True)),
+        Column("results", JSONB, nullable=False),
+        Column("last_attempt_failed", Boolean, nullable=False),
+        CheckConstraint(f"cardinality(attempt_ids) <= {ANALYSIS_RUN_CALL_LIMIT}"),
+        CheckConstraint("jsonb_array_length(results) <= 2"),
+        schema=schema,
+    )
+
+
+def create_analysis_runs(connection: Connection, workspace_id: UUID) -> None:
+    """Provision the opt-in checkpoint table with the workspace operator connection."""
+    schema = f"w_{workspace_id.hex}"
+    _analysis_runs(schema).create(connection, checkfirst=True)
+    connection.exec_driver_sql(f"GRANT SELECT, INSERT ON {schema}.analysis_runs TO {schema}_writer")
+    connection.exec_driver_sql(
+        f"GRANT UPDATE (attempt_ids, lease_until, results, last_attempt_failed) "
+        f"ON {schema}.analysis_runs TO {schema}_writer"
+    )
+
+
+def purge_expired_analysis_runs(connection: Connection, workspace_id: UUID) -> int:
+    """Remove expired checkpoints using the workspace operator connection."""
+    runs = _analysis_runs(f"w_{workspace_id.hex}")
+    return connection.execute(delete(runs).where(runs.c.expires_at <= func.statement_timestamp())).rowcount
+
+
+def create_analysis_run_purge(connection: Connection, workspace_id: UUID) -> None:
+    """Grant a provisioned workspace purge role access to the scheduled operation."""
+    schema = f"w_{workspace_id.hex}"
+    operation = f"{schema}.purge_expired_analysis_runs()"
+    connection.exec_driver_sql(f"""
+        CREATE OR REPLACE FUNCTION {operation}
+        RETURNS bigint
+        LANGUAGE SQL
+        SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp
+        BEGIN ATOMIC
+            WITH expired AS (
+                DELETE FROM {schema}.analysis_runs
+                WHERE expires_at <= pg_catalog.statement_timestamp()
+                RETURNING 1
+            )
+            SELECT pg_catalog.count(*) FROM expired;
+        END
+    """)
+    connection.exec_driver_sql(f"REVOKE ALL ON FUNCTION {operation} FROM PUBLIC, {schema}_reader, {schema}_writer")
+    connection.exec_driver_sql(f"GRANT USAGE ON SCHEMA {schema} TO {schema}_purger")
+    connection.exec_driver_sql(f"GRANT EXECUTE ON FUNCTION {operation} TO {schema}_purger")
+
+
 class WorkspaceDatasets:
     def __init__(
         self,
@@ -206,6 +307,7 @@ class WorkspaceDatasets:
         self._catalog = version_catalog(self._schema)
         self._receipts = _upload_receipts(self._schema)
         self._results = _analysis_results(self._schema)
+        self._runs = _analysis_runs(self._schema)
 
     def _check_access(self, *, write: bool) -> None:
         if self._resolve_access() != self._access or (write and not self._access.can_manage):
@@ -392,10 +494,7 @@ class WorkspaceDatasets:
         if result.access != self._access:
             raise PermissionError("This analysis result is unavailable.")
         column = result.request.column if isinstance(result.request, WorkspaceColumnSummary) else None
-        metrics = [
-            [key, type(value).__name__, str(value)] if value is not None else [key, None, None]
-            for key, value in result.values.items()
-        ]
+        metrics = _encode_metrics(result)
         version_id = result.request.version_id
         with self._transaction(write=True) as connection:
             self._metadata(connection, version_id)
@@ -428,9 +527,112 @@ class WorkspaceDatasets:
         request = WorkspaceRowCount(version_id=version_id)
         if row.column_name is not None:
             request = WorkspaceColumnSummary(version_id=version_id, column=row.column_name)
-        types = {"int": int, "float": float, "Decimal": Decimal}
-        values = {key: types[kind](value) if kind is not None else None for key, kind, value in row.metrics}
-        return WorkspaceAnalysis(result_id=result_id, access=self._access, request=request, values=values)
+        return WorkspaceAnalysis(result_id, self._access, request, _decode_metrics(row.metrics))
+
+    def analysis_runs_available(self) -> bool:
+        """Expose the opt-in controls only in provisioned manager workspaces."""
+        if not self._access.can_manage or self._access.membership_revision is None:
+            return False
+        with self._transaction() as connection:
+            return inspect(connection).has_table(self._runs.name, schema=self._schema)
+
+    def start_analysis_run(self, request: WorkspaceColumnSummary, *, conversation_id: UUID) -> WorkspaceAnalysisRun:
+        """Start a fresh count and column summary for one authorized dataset version."""
+        with self._transaction(write=True) as connection:
+            if self._access.membership_revision is None:
+                raise PermissionError("This analysis run is unavailable.")
+            dataset = self._metadata(connection, request.version_id)
+            if request.column not in dataset.columns:
+                raise PermissionError("This dataset column is unavailable.")
+            now = connection.scalar(select(func.clock_timestamp()))
+            row = connection.execute(insert(self._runs).values(
+                run_id=uuid4(), version_id=request.version_id, column_name=request.column,
+                principal_id=self._access.principal_id, membership_revision=self._access.membership_revision,
+                conversation_id=conversation_id, policy_version=_ANALYSIS_RUN_POLICY,
+                expires_at=now + _ANALYSIS_RUN_RETENTION, attempt_ids=[], results=[], last_attempt_failed=False,
+            ).returning(self._runs)).one()
+            return self._analysis_run_snapshot(row, now)
+
+    def resume_analysis_run(
+        self, run_id: UUID, *, version_id: UUID, conversation_id: UUID,
+    ) -> WorkspaceAnalysisRun:
+        """Restore collected results into the currently authorized manager session."""
+        with self._transaction(write=True) as connection:
+            row, now = self._load_analysis_run(connection, run_id, version_id, conversation_id)
+            return self._analysis_run_snapshot(row, now)
+
+    def advance_analysis_run(
+        self, run_id: UUID, *, version_id: UUID, conversation_id: UUID, attempt_id: UUID,
+    ) -> WorkspaceAnalysisRun:
+        """Reserve and execute up to one task, charging a repeated attempt ID once."""
+        with self._transaction(write=True) as connection:
+            row, now = self._load_analysis_run(connection, run_id, version_id, conversation_id, lock=True)
+            current = self._analysis_run_snapshot(row, now)
+            if attempt_id in row.attempt_ids or current.complete or current.in_progress or not current.calls_remaining:
+                return current
+            connection.execute(update(self._runs).where(self._runs.c.run_id == run_id).values(
+                attempt_ids=[*row.attempt_ids, attempt_id],
+                lease_until=min(now + _ANALYSIS_ATTEMPT_LEASE, row.expires_at),
+                last_attempt_failed=False,
+            ))
+            request = self._analysis_run_requests(row)[len(row.results)]
+
+        try:
+            result = self.summarize(request)
+        except (SQLAlchemyError, ValueError):
+            result = None
+
+        with self._transaction(write=True) as connection:
+            row, now = self._load_analysis_run(connection, run_id, version_id, conversation_id, lock=True)
+            if row.attempt_ids[-1] != attempt_id or row.lease_until is None or row.lease_until <= now:
+                return self._analysis_run_snapshot(row, now)
+            results = row.results
+            if result is not None:
+                results = [*results, [str(result.result_id), _encode_metrics(result)]]
+            updated = connection.execute(update(self._runs).where(self._runs.c.run_id == run_id).values(
+                lease_until=None, results=results, last_attempt_failed=result is None,
+            ).returning(self._runs)).one()
+            return self._analysis_run_snapshot(updated, now)
+
+    def _load_analysis_run(
+        self, connection: Connection, run_id: UUID, version_id: UUID, conversation_id: UUID, *, lock: bool = False,
+    ):
+        if self._access.membership_revision is None:
+            raise PermissionError("This analysis run is unavailable.")
+        runs = self._runs.c
+        statement = select(self._runs).where(
+            runs.run_id == run_id, runs.version_id == version_id, runs.conversation_id == conversation_id,
+            runs.principal_id == self._access.principal_id, runs.membership_revision == self._access.membership_revision,
+            runs.policy_version == _ANALYSIS_RUN_POLICY,
+        )
+        if lock:
+            statement = statement.with_for_update()
+        row = connection.execute(statement).one_or_none()
+        self._check_access(write=True)
+        now = connection.scalar(select(func.clock_timestamp()))
+        if row is None or row.expires_at <= now:
+            raise PermissionError("This analysis run is unavailable.")
+        return row, now
+
+    @staticmethod
+    def _analysis_run_requests(row) -> tuple[WorkspaceRowCount, WorkspaceColumnSummary]:
+        return (
+            WorkspaceRowCount(version_id=row.version_id),
+            WorkspaceColumnSummary(version_id=row.version_id, column=row.column_name),
+        )
+
+    def _analysis_run_snapshot(self, row, now: datetime) -> WorkspaceAnalysisRun:
+        requests = self._analysis_run_requests(row)
+        results = tuple(
+            WorkspaceAnalysis(UUID(result_id), self._access, request, _decode_metrics(metrics))
+            for (result_id, metrics), request in zip(row.results, requests)
+        )
+        active = row.lease_until is not None and row.lease_until > now
+        interrupted = row.lease_until is not None and not active
+        return WorkspaceAnalysisRun(
+            row.run_id, requests[1], row.expires_at, results, len(row.attempt_ids), active,
+            row.last_attempt_failed or interrupted,
+        )
 
     def preview_cleaning(self, plan: WorkspaceTrimWhitespace) -> WorkspaceCleaningPreview:
         """Evaluate one typed cleaning operation against the authorized source."""

@@ -1,6 +1,7 @@
 """Streamlit views for the bounded demo reader."""
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from html import escape
@@ -22,6 +23,17 @@ from ui.service_status import render_service_unavailable
 logger = logging.getLogger(__name__)
 
 _DEMO_QUERY_POLICY_VERSION = 1
+_COUNT_QUESTION = re.compile(
+    r"count(?: (?:the )?(?:rows|records))?"
+    r"|how many (?:rows|records)(?: are there)?"
+    r"|(?:(?:give me|show(?: me)?|tell me|what(?: is|['’]s)) )?"
+    r"(?:(?:the |a )?total |the )?(?:row count|number of (?:rows|records))"
+)
+_PREVIEW_QUESTION = re.compile(
+    r"preview|show (?:me )?(?:the )?rows"
+    r"|(?:(?:show(?: me)?|give me|can i see) )?"
+    r"a (?:preview|sample)(?: of (?:the )?(?:rows|records))?"
+)
 
 
 @dataclass(frozen=True)
@@ -148,6 +160,33 @@ def render_demo_chat(
                     st.write(message)
 
 
+def _demo_operation(question: str, label: str) -> str | None:
+    for suffix in (
+        f" are in {label}", f" in {label}", f" of {label}", f" {label}",
+        " are in this dataset", " in this dataset", " of this dataset",
+    ):
+        if question.endswith(suffix):
+            question = question.removesuffix(suffix)
+            break
+    if question == "both":
+        return "both"
+
+    def single_operation(phrase: str) -> str | None:
+        if _COUNT_QUESTION.fullmatch(phrase):
+            return "count"
+        if _PREVIEW_QUESTION.fullmatch(phrase):
+            return "preview"
+        return None
+
+    first, conjunction, second = question.partition(" and ")
+    operation = single_operation(first)
+    if not conjunction:
+        return operation
+    if {operation, single_operation(second)} == {"count", "preview"}:
+        return "both"
+    return None
+
+
 def _run_demo_question(
     version: DemoVersion, versions: tuple[DemoVersion, ...], question: str | None,
     execute: Callable[[DemoCount], list[dict]], run_plan: Callable[[DemoPlan], tuple[DemoTaskOutcome, ...]],
@@ -168,11 +207,12 @@ def _run_demo_question(
                 st.info(f"Ask a new question about {version.label}. You can request a row count, a preview, or both.")
                 return ()
             normalized = previous
-        if normalized in {"count", "row count", "how many rows", f"how many rows are in {label}"}:
+        operation = _demo_operation(normalized, label)
+        if operation == "count":
             request = DemoCount(version_id=selected)
-        elif normalized in {"preview", "show rows", f"preview {label}"}:
+        elif operation == "preview":
             request = DemoPreview(version_id=selected, limit=10)
-        elif normalized in {"both", "count and preview", f"count and preview {label}"}:
+        elif operation == "both":
             plan = DemoPlan(tasks=(
                 DemoCountTask(task_id="count", operation="count", request=DemoCount(version_id=selected)),
                 DemoPreviewTask(task_id="preview", operation="preview", request=DemoPreview(version_id=selected, limit=10)),
@@ -193,7 +233,7 @@ def _run_demo_question(
         else:
             for other in versions:
                 name = other.label.casefold()
-                if normalized in {f"preview {name}", f"how many rows are in {name}", f"count and preview {name}"}:
+                if name != label and _demo_operation(normalized, name):
                     st.info(f"Choose {other.label} in the dataset picker, then ask again.")
                     return ()
             st.info(f"For {version.label}, would you like a row count, a preview, or both?")

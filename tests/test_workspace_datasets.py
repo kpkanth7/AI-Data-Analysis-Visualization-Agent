@@ -2,11 +2,15 @@
 
 import csv
 import json
+import subprocess
+import sys
 from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import timedelta
 from io import StringIO
-from threading import Barrier
+from pathlib import Path
+from threading import Barrier, Event
 from time import time
 from types import SimpleNamespace
 from uuid import uuid4
@@ -22,10 +26,11 @@ from streamlit.testing.v1 import AppTest
 
 from db.demo_catalog import DEMO_READER
 from db.workspace_datasets import (
-    MAX_UPLOAD_ROWS, ROW_KEY, WORKSPACE_UPLOADS_PER_DAY, CleaningPreviewChanged,
+    ANALYSIS_RUN_CALL_LIMIT, MAX_UPLOAD_ROWS, ROW_KEY, WORKSPACE_UPLOADS_PER_DAY, CleaningPreviewChanged,
     UploadLimitReached, UploadRequestConflict,
     WorkspaceAccess, WorkspaceColumnSummary, WorkspaceDatasets, WorkspaceRowCount, WorkspaceTrimWhitespace,
-    create_analysis_results, create_upload_receipts, version_catalog,
+    create_analysis_results, create_analysis_run_purge, create_analysis_runs, create_upload_receipts,
+    purge_expired_analysis_runs, version_catalog,
 )
 from scripts.stage_demo_catalog import grant_demo_access, stage_demo_catalog
 from db.workspace_memberships import (
@@ -579,6 +584,309 @@ def test_saved_analysis_is_exact_owner_scoped_and_removed_with_version(make_work
         new_session.restore_analysis(dataset.version_id, result.result_id)
 
 
+@pytest.fixture
+def analysis_run(make_workspace, workspace_database):
+    _, access, state, schema, reader, writer = make_workspace("alice")
+    access = replace(access, membership_revision=uuid4())
+    state.current = access
+    service = WorkspaceDatasets(access, lambda: state.current, reader, writer)
+    dataset = service.upload(pd.DataFrame({"value": [9007199254740993, -2]}), "analysis.csv")
+    request = WorkspaceColumnSummary(version_id=dataset.version_id, column="value")
+    scope = {"version_id": dataset.version_id, "conversation_id": uuid4()}
+    with workspace_database.begin() as connection:
+        create_analysis_runs(connection, access.workspace_id)
+    started = service.start_analysis_run(request, conversation_id=scope["conversation_id"])
+    return SimpleNamespace(
+        service=service, access=access, state=state, schema=schema, reader=reader, writer=writer,
+        request=request, scope=scope, started=started, run_id=started.run_id,
+    )
+
+
+def test_analysis_run_restores_exact_completed_work_in_a_fresh_session(analysis_run, monkeypatch):
+    run = analysis_run
+    first_attempt = uuid4()
+    first = run.service.advance_analysis_run(run.run_id, attempt_id=first_attempt, **run.scope)
+    assert first.calls_used == 1 and not first.complete
+    assert first.results[0].values == {"row_count": 2}
+
+    access = replace(run.access, session_id=uuid4())
+    run.state.current = access
+    fresh = WorkspaceDatasets(access, lambda: run.state.current, run.reader, run.writer)
+    calls = []
+    summarize = fresh.summarize
+
+    def track(request):
+        calls.append(request)
+        return summarize(request)
+
+    monkeypatch.setattr(fresh, "summarize", track)
+    restored = fresh.resume_analysis_run(run.run_id, **run.scope)
+    assert restored.results == (replace(first.results[0], access=access),)
+    assert restored.expires_at == run.started.expires_at
+    assert fresh.advance_analysis_run(run.run_id, attempt_id=first_attempt, **run.scope) == restored
+    assert calls == []
+
+    finished = fresh.advance_analysis_run(run.run_id, attempt_id=uuid4(), **run.scope)
+    assert finished.complete and finished.calls_used == 2
+    assert calls == [run.request]
+    assert finished.results[0] == restored.results[0]
+    assert finished.results[1].values["maximum"] == 9007199254740993
+    assert finished.results[1].values == summarize(run.request).values
+    assert fresh.advance_analysis_run(run.run_id, attempt_id=uuid4(), **run.scope) == finished
+    assert calls == [run.request]
+
+
+def test_analysis_run_survives_a_fresh_python_process(analysis_run):
+    run = analysis_run
+    first = run.service.advance_analysis_run(run.run_id, attempt_id=uuid4(), **run.scope)
+    configuration = {
+        "socket": run.reader.url.query["host"],
+        "schema": run.schema,
+        "principal": run.access.principal_id,
+        "workspace": str(run.access.workspace_id),
+        "revision": str(run.access.membership_revision),
+        "run": str(run.run_id),
+        "version": str(run.scope["version_id"]),
+        "conversation": str(run.scope["conversation_id"]),
+    }
+    process = subprocess.run(
+        [sys.executable, "-c", """
+import json
+import sys
+from uuid import UUID, uuid4
+
+from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
+from sqlalchemy.pool import NullPool
+
+from db.workspace_datasets import WorkspaceAccess, WorkspaceDatasets
+
+config = json.load(sys.stdin)
+url = URL.create("postgresql+psycopg2", database="postgres", query={"host": config["socket"]})
+reader, writer = (
+    create_engine(url.set(username=f"{config['schema']}_{role}"), poolclass=NullPool)
+    for role in ("reader", "writer")
+)
+access = WorkspaceAccess(config["principal"], uuid4(), UUID(config["workspace"]), True, UUID(config["revision"]))
+service = WorkspaceDatasets(access, lambda: access, reader, writer)
+scope = {"version_id": UUID(config["version"]), "conversation_id": UUID(config["conversation"])}
+finished = service.advance_analysis_run(UUID(config["run"]), attempt_id=uuid4(), **scope)
+print(json.dumps({
+    "results": [str(result.result_id) for result in finished.results],
+    "calls_used": finished.calls_used,
+    "complete": finished.complete,
+}))
+"""],
+        input=json.dumps(configuration), capture_output=True, text=True, check=True, timeout=15,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    finished = run.service.resume_analysis_run(run.run_id, **run.scope)
+    assert json.loads(process.stdout) == {
+        "results": [str(result.result_id) for result in finished.results],
+        "calls_used": 2,
+        "complete": True,
+    }
+    assert finished.complete and finished.results[0] == first.results[0]
+    assert finished.results[1].request == run.request
+
+
+def test_analysis_run_reserves_once_and_rejects_late_completion(analysis_run, workspace_database, monkeypatch):
+    run = analysis_run
+    first_attempt = uuid4()
+    started, release = Event(), Event()
+    calls = []
+    summarize = run.service.summarize
+
+    def hold_first(request):
+        calls.append(request)
+        result = summarize(request)
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(timeout=10)
+            return replace(result, result_id=late_result_id)
+        return result
+
+    late_result_id = uuid4()
+    monkeypatch.setattr(run.service, "summarize", hold_first)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(run.service.advance_analysis_run, run.run_id, attempt_id=first_attempt, **run.scope)
+        try:
+            assert started.wait(timeout=10)
+            duplicate = run.service.advance_analysis_run(run.run_id, attempt_id=first_attempt, **run.scope)
+            assert duplicate.in_progress and duplicate.calls_used == 1
+            assert run.service.advance_analysis_run(run.run_id, attempt_id=uuid4(), **run.scope) == duplicate
+            assert len(calls) == 1
+            with workspace_database.begin() as connection:
+                connection.exec_driver_sql(
+                    f"UPDATE {run.schema}.analysis_runs SET lease_until = clock_timestamp() - interval '1 second' "
+                    "WHERE run_id = %s", (str(run.run_id),),
+                )
+            interrupted = run.service.resume_analysis_run(run.run_id, **run.scope)
+            assert not interrupted.in_progress and interrupted.last_attempt_failed and interrupted.calls_used == 1
+            assert run.service.advance_analysis_run(run.run_id, attempt_id=first_attempt, **run.scope) == interrupted
+            recovered = run.service.advance_analysis_run(run.run_id, attempt_id=uuid4(), **run.scope)
+            assert recovered.calls_used == 2 and len(recovered.results) == 1
+        finally:
+            release.set()
+        assert pending.result(timeout=10) == recovered
+    assert len(calls) == 2 and recovered.results[0].result_id != late_result_id
+
+
+def test_analysis_run_failed_attempts_share_the_original_call_budget(analysis_run, monkeypatch):
+    run = analysis_run
+    first = run.service.advance_analysis_run(run.run_id, attempt_id=uuid4(), **run.scope)
+    calls = []
+
+    def fail(request):
+        calls.append(request)
+        raise ProgrammingError(None, None, RuntimeError("synthetic failure"))
+
+    monkeypatch.setattr(run.service, "summarize", fail)
+    for expected in range(2, ANALYSIS_RUN_CALL_LIMIT + 1):
+        attempt = uuid4()
+        status = run.service.advance_analysis_run(run.run_id, attempt_id=attempt, **run.scope)
+        assert status.last_attempt_failed and not status.in_progress
+        assert status.calls_used == expected and status.results == first.results
+        assert run.service.advance_analysis_run(run.run_id, attempt_id=attempt, **run.scope) == status
+    assert run.service.advance_analysis_run(run.run_id, attempt_id=uuid4(), **run.scope) == status
+    assert status.calls_remaining == 0
+    assert calls == [run.request] * (ANALYSIS_RUN_CALL_LIMIT - 1)
+
+
+def test_analysis_run_rechecks_ownership_and_revocation_during_a_read(
+    analysis_run, make_workspace, workspace_database, monkeypatch,
+):
+    run = analysis_run
+    for access in (
+        replace(run.access, principal_id="bob"),
+        replace(run.access, can_manage=False),
+        replace(run.access, membership_revision=None),
+        replace(run.access, membership_revision=uuid4()),
+    ):
+        actor = WorkspaceDatasets(access, lambda: access, run.reader, run.writer)
+        with pytest.raises(PermissionError):
+            actor.resume_analysis_run(run.run_id, **run.scope)
+
+    for field in ("conversation_id", "version_id"):
+        with pytest.raises(PermissionError):
+            run.service.resume_analysis_run(run.run_id, **{**run.scope, field: uuid4()})
+    _, foreign, _, _, reader, writer = make_workspace(run.access.principal_id)
+    foreign = replace(foreign, membership_revision=run.access.membership_revision)
+    with workspace_database.begin() as connection:
+        create_analysis_runs(connection, foreign.workspace_id)
+    other_workspace = WorkspaceDatasets(foreign, lambda: foreign, reader, writer)
+    with pytest.raises(PermissionError):
+        other_workspace.resume_analysis_run(run.run_id, **run.scope)
+    with monkeypatch.context() as policy:
+        policy.setattr("db.workspace_datasets._ANALYSIS_RUN_POLICY", 2)
+        with pytest.raises(PermissionError):
+            run.service.resume_analysis_run(run.run_id, **run.scope)
+    bad_request = run.request.model_copy(update={"column": "hidden"})
+    with pytest.raises(PermissionError):
+        run.service.start_analysis_run(bad_request, conversation_id=uuid4())
+
+    summarize = run.service.summarize
+
+    def revoke(request):
+        result = summarize(request)
+        run.state.current = None
+        return result
+
+    monkeypatch.setattr(run.service, "summarize", revoke)
+    with pytest.raises(PermissionError):
+        run.service.advance_analysis_run(run.run_id, attempt_id=uuid4(), **run.scope)
+    with pytest.raises(PermissionError):
+        run.service.resume_analysis_run(run.run_id, **run.scope)
+    run.state.current = run.access
+    recovered = run.service.resume_analysis_run(run.run_id, **run.scope)
+    assert recovered.calls_used == 1 and recovered.in_progress
+    assert recovered.results == ()
+
+
+def test_analysis_run_expiry_purge_and_version_deletion(analysis_run, workspace_database):
+    run = analysis_run
+    with workspace_database.begin() as connection:
+        remaining = connection.exec_driver_sql(
+            f"SELECT expires_at - clock_timestamp() FROM {run.schema}.analysis_runs",
+        ).scalar_one()
+        assert timedelta(hours=23, minutes=59) < remaining <= timedelta(hours=24)
+        assert purge_expired_analysis_runs(connection, run.access.workspace_id) == 0
+        connection.exec_driver_sql(f"UPDATE {run.schema}.analysis_runs SET expires_at = clock_timestamp()")
+    with pytest.raises(PermissionError):
+        run.service.resume_analysis_run(run.run_id, **run.scope)
+    with pytest.raises(PermissionError):
+        run.service.advance_analysis_run(run.run_id, attempt_id=uuid4(), **run.scope)
+    with workspace_database.begin() as connection:
+        assert purge_expired_analysis_runs(connection, run.access.workspace_id) == 1
+
+    fresh = run.service.start_analysis_run(run.request, conversation_id=run.scope["conversation_id"])
+    with run.reader.connect() as connection, pytest.raises(ProgrammingError) as denied:
+        connection.exec_driver_sql(f"SELECT run_id FROM {run.schema}.analysis_runs")
+    assert denied.value.orig.pgcode == "42501"
+    with run.writer.connect() as connection, pytest.raises(ProgrammingError) as denied:
+        connection.exec_driver_sql(f"UPDATE {run.schema}.analysis_runs SET expires_at = clock_timestamp()")
+    assert denied.value.orig.pgcode == "42501"
+    run.service.delete(run.scope["version_id"])
+    with pytest.raises(PermissionError):
+        run.service.resume_analysis_run(fresh.run_id, **run.scope)
+    with workspace_database.connect() as connection:
+        assert connection.exec_driver_sql(f"SELECT count(*) FROM {run.schema}.analysis_runs").scalar_one() == 0
+
+
+def test_analysis_run_scheduled_purge_is_expiry_only_and_workspace_scoped(
+    analysis_run, make_workspace, workspace_database,
+):
+    run = analysis_run
+    live_run = run.service.start_analysis_run(run.request, conversation_id=run.scope["conversation_id"])
+    other, other_access, other_state, other_schema, other_reader, other_writer = make_workspace("other-manager")
+    other_dataset = other.upload(pd.DataFrame({"value": [0]}), "another.csv")
+    other_access = replace(other_access, membership_revision=uuid4())
+    other_state.current = other_access
+    other = WorkspaceDatasets(other_access, lambda: other_state.current, other_reader, other_writer)
+    with workspace_database.begin() as connection:
+        create_analysis_runs(connection, other_access.workspace_id)
+        for schema, access in ((run.schema, run.access), (other_schema, other_access)):
+            connection.exec_driver_sql(f"CREATE ROLE {schema}_purger LOGIN NOINHERIT")
+            create_analysis_run_purge(connection, access.workspace_id)
+    other.start_analysis_run(
+        WorkspaceColumnSummary(version_id=other_dataset.version_id, column="value"), conversation_id=uuid4(),
+    )
+    with workspace_database.begin() as connection:
+        connection.exec_driver_sql(
+            f"UPDATE {run.schema}.analysis_runs SET expires_at = clock_timestamp() WHERE run_id = %s",
+            (str(run.run_id),),
+        )
+        connection.exec_driver_sql(f"UPDATE {other_schema}.analysis_runs SET expires_at = clock_timestamp()")
+
+    job = f"SELECT {run.schema}.purge_expired_analysis_runs()"
+    scheduler = create_engine(workspace_database.url.set(username=f"{run.schema}_purger"), poolclass=NullPool)
+    try:
+        for expected in (1, 0):
+            with scheduler.begin() as connection:
+                assert connection.exec_driver_sql(job).scalar_one() == expected
+        for statement in (
+            f"SELECT * FROM {run.schema}.analysis_runs",
+            f"DELETE FROM {run.schema}.analysis_runs",
+            f"TRUNCATE {run.schema}.analysis_runs",
+            f"SELECT * FROM {run.schema}.dataset_versions",
+            f"CREATE TABLE {run.schema}.unexpected (id integer)",
+            f"SELECT {other_schema}.purge_expired_analysis_runs()",
+        ):
+            with scheduler.begin() as connection, pytest.raises(ProgrammingError) as denied:
+                connection.exec_driver_sql(statement)
+            assert denied.value.orig.pgcode == "42501"
+    finally:
+        scheduler.dispose()
+
+    for engine in (run.reader, run.writer):
+        with engine.begin() as connection, pytest.raises(ProgrammingError) as denied:
+            connection.exec_driver_sql(job)
+        assert denied.value.orig.pgcode == "42501"
+    assert run.service.resume_analysis_run(live_run.run_id, **run.scope) == live_run
+    with workspace_database.connect() as connection:
+        assert connection.exec_driver_sql(f"SELECT count(*) FROM {other_schema}.analysis_runs").scalar_one() == 1
+
+
 def test_cleaning_preview_is_bounded_and_preserves_source(make_workspace, workspace_database):
     service, access, state, schema, reader, writer = make_workspace("alice")
     other, *_ = make_workspace("bob")
@@ -957,6 +1265,178 @@ def test_pilot_restores_saved_analysis_and_keeps_csv_on_save_failure(
     assert not app.exception and not app.get("plotly_chart") and not app.get("iframe")
 
 
+@pytest.fixture
+def manager_run_ui(make_workspace, workspace_database, membership_reader, monkeypatch):
+    service, access, _, schema, reader, writer = make_workspace("checkpoint-manager")
+    data = pd.DataFrame({"value": [-3, 5], "other": [40, 60]})
+    dataset = service.upload(data, "analysis.csv")
+    second = service.upload(data, "another.csv")
+    issuer, subject = "https://issuer.example", "checkpoint-manager"
+    claims = {"is_logged_in": True, "iss": issuer, "sub": subject, "exp": int(time()) + 120}
+    monkeypatch.setattr(st, "user", SimpleNamespace(to_dict=lambda: dict(claims), is_logged_in=True))
+    registry = MembershipRegistry(membership_reader)
+    with workspace_database.begin() as connection:
+        grant_membership(connection, issuer, subject, access.workspace_id, can_manage=True)
+
+    def open_workspace(version_id):
+        app = AppTest.from_function(_workspace_app, args=(registry.lookup, lambda _: (reader, writer))).run()
+        app.selectbox[0].set_value(version_id).run()
+        assert not app.exception
+        return app
+
+    return SimpleNamespace(
+        open=open_workspace, dataset=dataset, second=second, workspace_id=access.workspace_id,
+        schema=schema, issuer=issuer, subject=subject, claims=claims,
+    )
+
+
+def test_pilot_manager_resumes_and_retries_without_replaying_completed_work(
+    manager_run_ui, workspace_database, monkeypatch,
+):
+    pilot = manager_run_ui
+    option = "Count and summarize column"
+    app = pilot.open(pilot.dataset.version_id)
+    assert option not in app.radio[0].options
+    assert any(button.label == "Run analysis" for button in app.button)
+    with workspace_database.begin() as connection:
+        create_analysis_runs(connection, pilot.workspace_id)
+    app.run()
+    app.radio[0].set_value(option).run()
+
+    calls = []
+    summarize = WorkspaceDatasets.summarize
+
+    def fail_first_summary(service, request):
+        calls.append(request)
+        if len(calls) == 2:
+            raise ProgrammingError(None, None, RuntimeError("synthetic query failure"))
+        return summarize(service, request)
+
+    monkeypatch.setattr(WorkspaceDatasets, "summarize", fail_first_summary)
+
+    def click(app, label):
+        next(button for button in app.button if button.label == label).click().run()
+        assert not app.exception
+
+    next(box for box in app.selectbox if box.label == "Column for a new run").set_value("value").run()
+    click(app, "Start analysis run")
+    code = app.get("code")[0].proto.code_text
+    count_csv = app.get("iframe")[0].proto.srcdoc
+    assert "3 calls remaining." in [item.value for item in app.caption]
+    assert "Rows: 2" in [item.value for item in app.text]
+    assert calls == [WorkspaceRowCount(version_id=pilot.dataset.version_id)]
+
+    app = pilot.open(pilot.dataset.version_id)
+    app.radio[0].set_value(option).run()
+    next(box for box in app.selectbox if box.label == "Column for a new run").set_value("other").run()
+    next(widget for widget in app.text_input if widget.label == "Resume code").set_value(code)
+    click(app, "Resume run")
+    assert app.get("iframe")[0].proto.srcdoc == count_csv
+    assert "Run column: value" in [item.value for item in app.text]
+    assert len(calls) == 1
+
+    click(app, "Continue analysis")
+    assert any(item.value == "The last step did not finish." for item in app.warning)
+    assert "2 calls remaining." in [item.value for item in app.caption]
+    assert app.get("iframe")[0].proto.srcdoc == count_csv
+    app.run()
+    assert len(calls) == 2
+    click(app, "Retry step")
+    assert any(item.value == "Analysis run complete." for item in app.success)
+    assert "1 call remaining." in [item.value for item in app.caption]
+    assert "Sum: 2" in [item.value for item in app.text]
+    assert calls[1:] == [WorkspaceColumnSummary(version_id=pilot.dataset.version_id, column="value")] * 2
+    assert not any(button.label in {"Continue analysis", "Retry step"} for button in app.button)
+
+    with workspace_database.begin() as connection:
+        grant_membership(connection, pilot.issuer, pilot.subject, pilot.workspace_id, can_manage=False)
+    app.run()
+    assert not app.exception and not app.radio
+    assert not app.get("code") and not app.get("iframe")
+    assert not any(button.label == "Resume run" for button in app.button)
+    app.selectbox[0].set_value(pilot.dataset.version_id).run()
+    assert not app.exception and option not in app.radio[0].options
+    assert any(button.label == "Run analysis" for button in app.button)
+
+
+def test_pilot_resume_rejects_wrong_scope_expiry_and_revocation(manager_run_ui, workspace_database):
+    pilot = manager_run_ui
+    option = "Count and summarize column"
+    with workspace_database.begin() as connection:
+        create_analysis_runs(connection, pilot.workspace_id)
+
+    def open_run_tools(version_id):
+        app = pilot.open(version_id)
+        app.radio[0].set_value(option).run()
+        return app
+
+    app = open_run_tools(pilot.dataset.version_id)
+    next(button for button in app.button if button.label == "Start analysis run").click().run()
+    resume_code = app.get("code")[0].proto.code_text
+    assert app.get("iframe")
+
+    def assert_denied(app, code, message):
+        next(widget for widget in app.text_input if widget.label == "Resume code").set_value(code)
+        next(button for button in app.button if button.label == "Resume run").click().run()
+        assert not app.exception and not app.get("code") and not app.get("iframe")
+        assert any(item.value == message for item in app.warning)
+
+    denied = "This analysis run is unavailable for the selected dataset version."
+    wrong_dataset = open_run_tools(pilot.second.version_id)
+    assert_denied(wrong_dataset, "invalid", "Enter a valid resume code.")
+    assert_denied(wrong_dataset, resume_code, denied)
+
+    with workspace_database.begin() as connection:
+        grant_membership(connection, pilot.issuer, "other-manager", pilot.workspace_id, can_manage=True)
+    pilot.claims["sub"] = "other-manager"
+    assert_denied(open_run_tools(pilot.dataset.version_id), resume_code, denied)
+    pilot.claims["sub"] = pilot.subject
+    with workspace_database.begin() as connection:
+        connection.exec_driver_sql(f"UPDATE {pilot.schema}.analysis_runs SET expires_at = clock_timestamp()")
+    app.run()
+    assert not app.exception and not app.get("code") and not app.get("iframe")
+    assert any(item.value == denied for item in app.warning)
+    assert_denied(open_run_tools(pilot.dataset.version_id), resume_code, denied)
+    with workspace_database.begin() as connection:
+        revoke_membership(connection, pilot.issuer, pilot.subject)
+    app.run()
+    assert not app.exception and not app.radio and not app.get("iframe")
+    assert not any(button.label == "Resume run" for button in app.button)
+
+
+def test_pilot_delete_discloses_and_removes_only_the_selected_versions_runs(manager_run_ui, workspace_database):
+    pilot = manager_run_ui
+    with workspace_database.begin() as connection:
+        create_analysis_runs(connection, pilot.workspace_id)
+
+    def click(app, label):
+        next(button for button in app.button if button.label == label).click().run()
+        assert not app.exception
+
+    def start(version_id):
+        app = pilot.open(version_id)
+        app.radio[0].set_value("Count and summarize column").run()
+        click(app, "Start analysis run")
+        return app, app.get("code")[0].proto.code_text
+
+    _, other_code = start(pilot.second.version_id)
+    app, code = start(pilot.dataset.version_id)
+    click(app, "Delete dataset")
+    assert any("any resumable analysis runs" in warning.value for warning in app.warning)
+    click(app, "Cancel deletion")
+    assert app.get("code")[0].proto.code_text == code
+    assert app.get("iframe")
+
+    click(app, "Delete dataset")
+    click(app, "Confirm deletion")
+    assert not app.get("code") and not app.get("iframe")
+    assert app.selectbox[0].options == [f"{pilot.second.filename} ({pilot.second.version_id})"]
+    with workspace_database.connect() as connection:
+        assert str(connection.exec_driver_sql(
+            f"SELECT run_id FROM {pilot.schema}.analysis_runs"
+        ).scalar_one()) == other_code.split(".")[0]
+
+
 def test_pending_delete_cannot_survive_membership_change(
     make_workspace, workspace_database, membership_reader, monkeypatch,
 ):
@@ -994,9 +1474,7 @@ def test_pending_delete_cannot_survive_membership_change(
     next(button for button in app.button if button.label == "Prepare preview CSV").click().run()
     assert len(app.get("iframe")) == 1
     next(button for button in app.button if button.label == "Delete dataset").click().run()
-    assert "Delete this dataset version? This permanently removes its rows and saved analysis results." in [
-        warning.value for warning in app.warning
-    ]
+    assert any("any resumable analysis runs" in warning.value for warning in app.warning)
     confirm = next(button for button in app.button if button.label == "Confirm deletion")
 
     with workspace_database.begin() as connection:

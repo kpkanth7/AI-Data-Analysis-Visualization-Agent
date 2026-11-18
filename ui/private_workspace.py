@@ -4,7 +4,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -26,6 +26,7 @@ from ui.service_status import render_service_unavailable
 _PREFIX = "private_workspace_"
 _BINDING = f"{_PREFIX}binding"
 _SESSION = f"{_PREFIX}session"
+_RUN_OPERATION = "Count and summarize column"
 
 
 MembershipLookup = Callable[[str, str], WorkspaceMembership | None]
@@ -37,6 +38,13 @@ WorkspaceBinding = tuple[str, str, WorkspaceMembership]
 class CleaningReview:
     preview: WorkspaceCleaningPreview
     request_id: UUID | None = None
+
+
+@dataclass(frozen=True)
+class AnalysisRunLink:
+    run_id: UUID
+    conversation_id: UUID
+    expires_at: float
 
 
 def _current_binding(lookup: MembershipLookup) -> WorkspaceBinding | None:
@@ -66,8 +74,9 @@ def _sign_out() -> None:
 
 @st.fragment(run_every=2)
 def _watch_access(
-    lookup: MembershipLookup, binding: WorkspaceBinding, service: WorkspaceDatasets, selection_key: str,
+    lookup: MembershipLookup, binding: WorkspaceBinding, service: WorkspaceDatasets, prefix: str,
 ) -> None:
+    selection_key = f"{prefix}selection"
     try:
         if _current_binding(lookup) == binding:
             selection = st.session_state.get(selection_key)
@@ -76,6 +85,11 @@ def _watch_access(
                     service.metadata(selection)
                 except PermissionError:
                     st.session_state.pop(selection_key, None)
+                    st.rerun()
+                run_key = f"{prefix}analysis_{selection.hex}_checkpoint"
+                link = st.session_state.get(run_key)
+                if link is not None and link.expires_at <= time.time():
+                    del st.session_state[run_key]
                     st.rerun()
             return
     except (PermissionError, SQLAlchemyError):
@@ -111,7 +125,9 @@ def render_private_workspace(lookup: MembershipLookup, engines: WorkspaceEngines
 
     _, _, membership = binding
     session_id = st.session_state[_SESSION]
-    access = WorkspaceAccess(membership.principal_id, session_id, membership.workspace_id, membership.can_manage)
+    access = WorkspaceAccess(
+        membership.principal_id, session_id, membership.workspace_id, membership.can_manage, membership.revision,
+    )
     prefix = f"{_PREFIX}{session_id.hex}_"
 
     def resolve_access() -> WorkspaceAccess | None:
@@ -122,7 +138,7 @@ def render_private_workspace(lookup: MembershipLookup, engines: WorkspaceEngines
     content = st.empty()
     try:
         service = WorkspaceDatasets(access, resolve_access, *engines(access.workspace_id))
-        _watch_access(lookup, binding, service, f"{prefix}selection")
+        _watch_access(lookup, binding, service, prefix)
         with content.container():
             _render_datasets(service, access, prefix)
     except PermissionError:
@@ -182,11 +198,20 @@ def _render_analysis(
     service: WorkspaceDatasets, dataset: WorkspaceDataset, access: WorkspaceAccess, prefix: str,
 ) -> None:
     with st.expander("Analyze dataset", expanded=True):
-        operation = st.radio("Operation", ("Count rows", "Summarize column"), key=f"{prefix}operation")
+        operations = ["Count rows", "Summarize column"]
+        if access.can_manage and service.analysis_runs_available():
+            operations.append(_RUN_OPERATION)
+        operation = st.radio("Operation", operations, key=f"{prefix}operation")
         request = WorkspaceRowCount(version_id=dataset.version_id)
-        if operation == "Summarize column":
-            column = st.selectbox("Column", dataset.columns, key=f"{prefix}column")
+        if operation in ("Summarize column", _RUN_OPERATION):
+            column = st.selectbox(
+                "Column for a new run" if operation == _RUN_OPERATION else "Column",
+                dataset.columns, key=f"{prefix}column",
+            )
             request = WorkspaceColumnSummary(version_id=dataset.version_id, column=column)
+            if operation == _RUN_OPERATION:
+                _render_analysis_run(service, request, prefix)
+                return
         feedback_key = f"{prefix}save_feedback"
         feedback = st.session_state.pop(feedback_key, None)
         result = None
@@ -223,25 +248,101 @@ def _render_analysis(
             saved = True
         if result is None:
             return
-        csv_data = service.analysis_csv(result)
-        executed = result.request
-        st.caption(f"Analysis scope: Entire dataset. Version: {executed.version_id}")
-        if isinstance(executed, WorkspaceColumnSummary):
-            st.text(f"Column: {executed.column}")
-        labels = {
-            "row_count": "Rows", "non_null_count": "Non-null values", "null_count": "Missing values",
-            "minimum": "Minimum", "maximum": "Maximum", "total": "Sum", "mean": "Mean",
-        }
-        for key, value in result.values.items():
-            st.text(f"{labels[key]}: {value if value is not None else 'No values'}")
-        _render_summary_chart(result)
-        st.caption(f"Analysis CSV result: {result.result_id}")
-        render_csv_link(csv_data, "Analysis CSV", "workspace-analysis.csv")
+        _render_analysis_result(service, result)
         if access.can_manage and not saved:
             st.button(
                 "Save result", key=f"{prefix}save_{result.result_id}", on_click=_save_analysis,
                 args=(service, result, feedback_key),
             )
+
+
+def _render_analysis_run(service: WorkspaceDatasets, request: WorkspaceColumnSummary, prefix: str) -> None:
+    key = f"{prefix}checkpoint"
+    link = st.session_state.get(key)
+    st.caption("Runs expire after 24 hours or when the dataset version is deleted.")
+    start = st.button("Start analysis run", key=f"{prefix}start_run")
+    with st.form(f"{prefix}resume_run"):
+        code = st.text_input("Resume code", max_chars=73)
+        resume = st.form_submit_button("Resume run")
+    try:
+        if start:
+            link = None
+            conversation_id = uuid4()
+            run = service.start_analysis_run(request, conversation_id=conversation_id)
+            link = AnalysisRunLink(run.run_id, conversation_id, run.expires_at.timestamp())
+            st.session_state[key] = link
+            run = service.advance_analysis_run(
+                link.run_id, version_id=request.version_id, conversation_id=link.conversation_id,
+                attempt_id=uuid5(link.run_id, "0"),
+            )
+        elif resume:
+            try:
+                run_id, conversation_id = (UUID(part) for part in code.strip().split("."))
+            except ValueError:
+                st.warning("Enter a valid resume code.")
+                return
+            run = service.resume_analysis_run(run_id, version_id=request.version_id, conversation_id=conversation_id)
+            link = AnalysisRunLink(run_id, conversation_id, run.expires_at.timestamp())
+            st.session_state[key] = link
+        elif link is not None:
+            run = service.resume_analysis_run(
+                link.run_id, version_id=request.version_id, conversation_id=link.conversation_id,
+            )
+        else:
+            return
+
+        if run.in_progress:
+            st.info("An attempt is in progress. Refresh to check its status.")
+            st.button("Refresh run status", key=f"{prefix}refresh_run")
+        elif not run.complete and run.calls_remaining:
+            action = "Retry step" if run.last_attempt_failed else "Continue analysis"
+            if st.button(action, key=f"{prefix}advance_{link.run_id.hex}_{run.calls_used}"):
+                service.advance_analysis_run(
+                    link.run_id, version_id=request.version_id, conversation_id=link.conversation_id,
+                    attempt_id=uuid5(link.run_id, str(run.calls_used)),
+                )
+                st.rerun()
+    except PermissionError:
+        st.session_state.pop(key, None)
+        st.warning("This analysis run is unavailable for the selected dataset version.")
+        return
+    except SQLAlchemyError:
+        st.warning("Analysis run status is unavailable. Try again.")
+        if not start or link is None:
+            return
+    else:
+        unit = "call" if run.calls_remaining == 1 else "calls"
+        st.caption(f"{run.calls_remaining} {unit} remaining.")
+        if run.complete:
+            st.success("Analysis run complete.")
+            _render_analysis_result(service, run.results[-1])
+        else:
+            st.text(f"Run column: {run.request.column}")
+            if run.last_attempt_failed:
+                st.warning("The last step did not finish.")
+            if not run.calls_remaining:
+                st.warning("This run has reached its call limit.")
+            if run.results:
+                _render_analysis_result(service, run.results[0])
+    st.caption("Keep this resume code to reopen the run in another session.")
+    st.code(f"{link.run_id}.{link.conversation_id}", language=None)
+
+
+def _render_analysis_result(service: WorkspaceDatasets, result: WorkspaceAnalysis) -> None:
+    csv_data = service.analysis_csv(result)
+    request = result.request
+    st.caption(f"Analysis scope: Entire dataset. Version: {request.version_id}")
+    if isinstance(request, WorkspaceColumnSummary):
+        st.text(f"Column: {request.column}")
+    labels = {
+        "row_count": "Rows", "non_null_count": "Non-null values", "null_count": "Missing values",
+        "minimum": "Minimum", "maximum": "Maximum", "total": "Sum", "mean": "Mean",
+    }
+    for key, value in result.values.items():
+        st.text(f"{labels[key]}: {value if value is not None else 'No values'}")
+    _render_summary_chart(result)
+    st.caption(f"Analysis CSV result: {result.result_id}")
+    render_csv_link(csv_data, "Analysis CSV", "workspace-analysis.csv")
 
 
 def _render_summary_chart(result: WorkspaceAnalysis) -> None:
@@ -430,7 +531,10 @@ def _render_datasets(service: WorkspaceDatasets, access: WorkspaceAccess, prefix
 
         st.button("Delete dataset", key=f"{prefix}request_{selection.hex}", on_click=request_deletion)
         if st.session_state.get(pending_key) == selection:
-            st.warning("Delete this dataset version? This permanently removes its rows and saved analysis results.")
+            st.warning(
+                "Delete this dataset version? This permanently removes its rows, saved analysis results, "
+                "and any resumable analysis runs."
+            )
             if st.button("Cancel deletion", key=f"{prefix}cancel_{selection.hex}"):
                 del st.session_state[pending_key]
                 st.rerun()

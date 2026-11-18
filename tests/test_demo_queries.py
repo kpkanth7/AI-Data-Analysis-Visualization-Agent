@@ -742,6 +742,60 @@ def test_demo_chat_clarifies_before_read_and_runs_compound_with_fresh_access(dem
     assert len(app.dataframe[0].value) == 10
 
 
+def test_demo_chat_paraphrases_keep_the_typed_and_scoped_read_paths(demo_queries, monkeypatch):
+    import demo_app
+
+    version = demo_queries.versions[0].version_id
+    calls = []
+    execute = demo_queries.execute
+    run_plan = demo_queries.run_plan
+
+    def track_request(request):
+        calls.append(request)
+        return execute(request)
+
+    def track_plan(plan):
+        calls.append(plan)
+        return run_plan(plan)
+
+    monkeypatch.setattr(demo_app, "_demo_queries", lambda: nullcontext(demo_queries))
+    monkeypatch.setattr(demo_queries, "execute", track_request)
+    monkeypatch.setattr(demo_queries, "run_plan", track_plan)
+    app = AppTest.from_function(_guarded_chat, args=(demo_queries,)).run(timeout=15)
+
+    def ask(question):
+        app.chat_input(key="demo_chat_input").set_value(question).run(timeout=15)
+        assert not app.exception and not app.error
+
+    ask("How many records are there?")
+    count = DemoCount(version_id=version)
+    assert calls == [count]
+    ask("Give me a preview of titanic.")
+    preview = DemoPreview(version_id=version, limit=10)
+    assert calls == [count, preview]
+
+    ask("A preview and the row count.")
+    plan = calls[2]
+    assert isinstance(plan, DemoPlan)
+    assert [(task.operation, task.request) for task in plan.tasks] == [("count", count), ("preview", preview)]
+    ask("again")
+    assert calls == [count, preview, plan, plan]
+
+    for question, hint in (
+        ("How many records are in sp500_financials?", "Choose sp500_financials in the dataset picker"),
+        ("Show a preview of world_co2_emissions.", "Choose world_co2_emissions in the dataset picker"),
+        ("Count the records in my uploaded CSV.", "would you like a row count"),
+        ("Count the rows where Survived = 1.", "would you like a row count"),
+        ("Show a preview and delete the dataset.", "would you like a row count"),
+        ("A preview of titanic and a count of sp500_financials.", "would you like a row count"),
+        ("Show me 5 rows.", "would you like a row count"),
+        ("again", "Ask a new question"),
+    ):
+        ask(question)
+        assert not app.dataframe and hint in app.info[0].value
+        assert calls == [count, preview, plan, plan]
+
+
 def test_demo_chat_shows_successful_count_after_preview_failure(demo_queries, monkeypatch):
     import demo_app
 
