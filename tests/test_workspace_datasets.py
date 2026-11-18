@@ -8,6 +8,7 @@ from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import timedelta
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from threading import Barrier, Event
@@ -507,6 +508,26 @@ def _workspace_app(lookup, engines):
     from ui.private_workspace import render_private_workspace
 
     render_private_workspace(lookup, engines)
+
+
+def test_summary_handles_existing_numeric_types_and_missing_columns(make_workspace, workspace_database):
+    workspace, _, _, schema, *_ = make_workspace("alice")
+    version = workspace.upload(pd.DataFrame({
+        "Exact amount": ["9007199254740993.01", "0.02", None],
+        "Removed": [1, 2, 3],
+    }), "typed.csv")
+    with workspace_database.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {schema}.v_{version.version_id.hex} '
+            'ALTER COLUMN "Exact amount" TYPE numeric USING "Exact amount"::numeric, DROP COLUMN "Removed"'
+        )
+
+    request = WorkspaceColumnSummary(version_id=version.version_id, column="Exact amount")
+    summary = workspace.summarize(request)
+    assert summary.values["non_null_count"] == 2
+    assert summary.values["total"] == Decimal("9007199254740993.03")
+    with pytest.raises(PermissionError, match="column is unavailable"):
+        workspace.summarize(WorkspaceColumnSummary(version_id=version.version_id, column="Removed"))
 
 
 def test_analysis_csv_preserves_executed_values_and_rechecks_access(make_workspace):

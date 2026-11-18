@@ -14,7 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from core.csv_export import csv_bytes
 from db.demo_queries import (
     DemoAccess, DemoCount, DemoCountTask, DemoFilter, DemoPlan, DemoPreview, DemoPreviewTask,
-    DemoQueries, DemoSort, DemoTaskOutcome, DemoTaskResult, DemoVersion,
+    DemoPreviewTooLarge, DemoQueries, DemoSort, DemoTaskOutcome, DemoTaskResult, DemoVersion,
 )
 from ui.csv_download import render_csv_link
 from ui.service_status import render_service_unavailable
@@ -23,6 +23,9 @@ from ui.service_status import render_service_unavailable
 logger = logging.getLogger(__name__)
 
 _DEMO_QUERY_POLICY_VERSION = 1
+_PREVIEW_LIMIT_MESSAGE = (
+    "This preview exceeds the size limit. Try selecting fewer rows or narrowing the filter in Explorer."
+)
 _COUNT_QUESTION = re.compile(
     r"count(?: (?:the )?(?:rows|records))?"
     r"|how many (?:rows|records)(?: are there)?"
@@ -134,7 +137,9 @@ def render_demo_chat(
     messages = []
     for outcome in outcomes:
         result = outcome.result
-        if result is None:
+        if outcome.reason == "result_limit":
+            messages.append(_PREVIEW_LIMIT_MESSAGE)
+        elif result is None:
             messages.append(f"The {outcome.task_id} could not finish.")
         elif isinstance(result.request, DemoPreview):
             messages.append(f"Showing {len(result.rows)} rows from {label}.")
@@ -250,6 +255,9 @@ def _run_demo_question(
     except DemoScopeChanged:
         _show_changed_access()
         return ()
+    except DemoPreviewTooLarge:
+        st.session_state.pop("demo_chat_failed_request", None)
+        return (DemoTaskOutcome("preview", "failed", reason="result_limit"),)
     except (KeyError, TypeError, ValueError, OSError, SQLAlchemyError) as exc:
         logger.warning("Demo question unavailable: %s", type(exc).__name__)
         st.session_state["demo_chat_failed_request"] = request
@@ -298,9 +306,14 @@ def render_demo_explorer(queries: DemoQueries) -> None:
     try:
         total = queries.execute(DemoCount(version_id=selected, filters=filters))[0]["row_count"]
         rows = queries.execute(request)
+    except DemoPreviewTooLarge:
+        rows = None
     except (PermissionError, SQLAlchemyError) as exc:
         render_service_unavailable("Dataset", "demo_explorer", exc)
         return
     unit = "row" if total == 1 else "rows"
     st.caption(f"{total:,} matching {unit}")
-    _render_preview(version, rows)
+    if rows is None:
+        st.warning(_PREVIEW_LIMIT_MESSAGE)
+    else:
+        _render_preview(version, rows)

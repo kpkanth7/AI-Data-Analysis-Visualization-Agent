@@ -1,8 +1,10 @@
 """Run the demo readers against a fresh PostgreSQL cluster on a private socket."""
 
 import csv
+import json
 import shutil
 import subprocess
+import sys
 import tempfile
 from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +19,7 @@ from uuid import uuid4
 import pandas as pd
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine, event, func
+from sqlalchemy import Column, Integer, MetaData, Table, Text, create_engine, event, func
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.pool import NullPool
@@ -25,8 +27,8 @@ from streamlit.testing.v1 import AppTest
 
 from db.demo_catalog import DEMO_READER, DEMO_WORKSPACE, ROW_KEY, load_demo_versions
 from db.demo_queries import (
-    DemoAccess, DemoCount, DemoCountTask, DemoEvidenceFilter, DemoFilter, DemoPlan, DemoPreview,
-    DemoPreviewTask, DemoQueries, DemoSort,
+    DEMO_PREVIEW_MAX_BYTES, DemoAccess, DemoCount, DemoCountTask, DemoEvidenceFilter, DemoFilter,
+    DemoPlan, DemoPreview, DemoPreviewTask, DemoPreviewTooLarge, DemoQueries, DemoSort, DemoVersion,
 )
 from scripts.stage_demo_catalog import grant_demo_access, revoke_demo_access, stage_demo_catalog
 
@@ -105,6 +107,80 @@ def demo_postgres(synthetic_demo_files):
 def demo_queries(demo_postgres):
     _, reader, versions = demo_postgres
     return DemoQueries(reader, DemoAccess("test_viewer", DEMO_WORKSPACE), versions)
+
+
+@pytest.fixture(scope="module")
+def wide_demo(demo_postgres):
+    owner, reader, _ = demo_postgres
+    table = Table(
+        "wide_preview", MetaData(), Column("id", Integer, primary_key=True),
+        Column("note", Text), Column("score", Integer), schema="demo",
+    )
+    exact = "é" * 32_761 + "a"
+    with owner.begin() as connection:
+        table.create(connection)
+        connection.execute(table.insert(), [
+            {"id": 1, "note": exact, "score": 1},
+            {"id": 2, "note": exact + '"', "score": 2},
+            {"id": 3, "note": "a" * 36_000, "score": 3},
+            {"id": 4, "note": "b" * 36_000, "score": 3},
+            {"id": 5, "note": "é" * 524_288, "score": 5},
+            {"id": 6, "note": None, "score": 6},
+        ])
+        connection.exec_driver_sql(f"GRANT SELECT ON demo.wide_preview TO {DEMO_READER}")
+    version = DemoVersion(uuid4(), DEMO_WORKSPACE, "Wide fixture", table, ("note", "score"), "id")
+    return DemoQueries(reader, DemoAccess("wide_viewer", DEMO_WORKSPACE), (version,))
+
+
+def test_demo_preview_limits_server_payload_bytes_with_original_order_and_types(demo_postgres, wide_demo):
+    _, reader, _ = demo_postgres
+    version = wide_demo.versions[0].version_id
+
+    def notes(score, **options):
+        return DemoPreview(
+            version_id=version, filters=(DemoFilter(column="score", value=score),),
+            columns=("note",), **options,
+        )
+
+    boundary = wide_demo.execute(notes(1))
+    assert len(json.dumps(boundary, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) == DEMO_PREVIEW_MAX_BYTES
+    with pytest.raises(DemoPreviewTooLarge, match="result size limit"):
+        wide_demo.execute(notes(2))
+    with pytest.raises(DemoPreviewTooLarge):
+        wide_demo.execute(notes(3))
+    assert wide_demo.execute(notes(3, limit=1, offset=1))[0]["note"].startswith("b")
+    assert wide_demo.execute(notes(6)) == [{"note": None}]
+    assert wide_demo.execute(notes(7)) == []
+    assert wide_demo.execute(DemoPreview(
+        version_id=version, columns=("score",), sort=(DemoSort(column="note", descending=True),), limit=2,
+    )) == [{"score": 6}, {"score": 5}]
+
+    with reader.begin() as connection:
+        # The cursor receives the size sentinel only, even for a one-row 1 MiB cell.
+        row = connection.execute(wide_demo._statement(notes(5))).one()
+    assert row[0] is None and row[1] == 1_048_589
+
+
+def test_demo_over_budget_preview_keeps_independent_count_and_blocks_dependents(wide_demo):
+    version = wide_demo.versions[0].version_id
+    count = DemoCount(version_id=version)
+    preview = DemoPreview(version_id=version, columns=("score", "note"))
+    plan = DemoPlan(tasks=(
+        DemoPreviewTask(task_id="source", operation="preview", request=preview),
+        DemoCountTask(task_id="independent", operation="count", request=count),
+        DemoCountTask(
+            task_id="dependent", operation="count", request=count, depends_on=("source",),
+            evidence_filters=(DemoEvidenceFilter(
+                column="score", source_task_id="source", source_column="score",
+            ),),
+        ),
+    ))
+    source, independent, dependent = wide_demo.run_plan(plan, max_calls=2)
+    assert (source.status, source.reason, source.result) == ("failed", "result_limit", None)
+    assert independent.status == "success" and independent.result.rows == wide_demo.execute(count)
+    assert dependent.status == "skipped_dependency" and dependent.result is None
+    with pytest.raises(DemoPreviewTooLarge):
+        wide_demo.execute_plan(plan)
 
 
 def test_demo_queries_validate_access_and_bind_filter_values(demo_postgres):
@@ -922,17 +998,35 @@ def _preview_csv(app, label):
     return list(csv.reader(StringIO(b64decode(encoded).decode("utf-8-sig"))))
 
 
+def test_demo_chat_and_explorer_explain_size_limit_without_losing_count(wide_demo):
+    app = AppTest.from_function(_demo_tabs, args=(wide_demo,)).run(timeout=15)
+    assert not app.exception and not app.dataframe and not app.get("iframe")
+    assert any(caption.value == "6 matching rows" for caption in app.caption)
+    assert any("preview exceeds the size limit" in warning.value for warning in app.warning)
+
+    app.chat_input(key="demo_chat_input").set_value("preview").run(timeout=15)
+    assert not app.exception and not app.get("iframe")
+    assert "preview exceeds the size limit" in app.chat_message[0].warning[0].value
+    assert not any(button.label == "Retry question" for button in app.button)
+
+    app.chat_input(key="demo_chat_input").set_value("count and preview").run(timeout=15)
+    assert not app.exception and not app.get("iframe")
+    assert any("Wide fixture has 6 rows" in message.value for message in app.chat_message[0].markdown)
+    assert "preview exceeds the size limit" in app.chat_message[0].warning[0].value
+
+    version = wide_demo.versions[0].version_id
+    app.selectbox(key=f"demo_filter_{version}").set_value("score").run(timeout=15)
+    app.text_input(key=f"demo_filter_value_{version}_score").set_value("6").run(timeout=15)
+    assert not app.exception and _preview_csv(app, "Preview CSV (1 row)") == [["note", "score"], ["", "6"]]
+
+
 @pytest.mark.parametrize("demo", DEMOS)
 def test_chat_and_explorer_agree_on_demo_results(demo, demo_queries, monkeypatch):
-    from ui import chat, explorer
+    import ui
 
-    def no_legacy_path(*args, **kwargs):
-        pytest.fail("Demo tabs must use the injected demo query service")
-
-    monkeypatch.setattr(chat, "run_agent", no_legacy_path)
-    monkeypatch.setattr(chat, "list_datasets_from_db", no_legacy_path)
-    monkeypatch.setattr(explorer, "list_datasets_from_db", no_legacy_path)
-    monkeypatch.setattr(explorer, "get_connection", no_legacy_path)
+    for module in ("chat", "explorer"):
+        monkeypatch.delattr(ui, module, raising=False)
+        monkeypatch.setitem(sys.modules, f"ui.{module}", None)
 
     version = next(item for item in demo_queries.versions if item.label == demo)
     app = AppTest.from_function(_demo_tabs, args=(demo_queries,)).run(timeout=15)
@@ -1062,15 +1156,11 @@ def test_demo_cutover_and_rollback_preserve_legacy_data(demo_postgres, monkeypat
 
 
 def test_demo_entrypoint_rejects_wrong_missing_and_unavailable_login(demo_postgres, monkeypatch, caplog):
-    from db import postgres
+    import db
 
     owner, reader, _ = demo_postgres
-
-    def no_legacy_connection(*args, **kwargs):
-        pytest.fail("The demo entry point must never fall back to the legacy database")
-
-    monkeypatch.setattr(postgres, "get_db_url", no_legacy_connection)
-    monkeypatch.setattr(postgres, "get_engine", no_legacy_connection)
+    monkeypatch.delattr(db, "postgres", raising=False)
+    monkeypatch.setitem(sys.modules, "db.postgres", None)
     for candidate in (None, owner.url, reader.url.set(database="private_connection_canary")):
         app = AppTest.from_file(str(APP_DIR / "app.py"))
         app.secrets["DATABASE_URL"] = owner.url.render_as_string(hide_password=False)

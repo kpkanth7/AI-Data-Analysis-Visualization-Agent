@@ -11,7 +11,7 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
-from sqlalchemy import ColumnElement, Select, Table, func, select
+from sqlalchemy import ColumnElement, Select, Table, Text, cast, func, literal_column, select
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
@@ -19,6 +19,11 @@ from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 _COMPARISONS = {"eq": eq, "ne": ne, "lt": lt, "le": le, "gt": gt, "ge": ge}
 _Comparison = Literal["eq", "ne", "lt", "le", "gt", "ge"]
 _PLAN_WORKERS = 2
+DEMO_PREVIEW_MAX_BYTES = 64 * 1024
+
+
+class DemoPreviewTooLarge(ValueError):
+    """The requested preview exceeds its UTF-8 JSON payload budget."""
 
 
 @contextmanager
@@ -167,7 +172,7 @@ class DemoTaskOutcome:
     task_id: str
     status: Literal["success", "failed", "skipped_dependency", "call_limit", "deadline", "cancelled"]
     result: DemoTaskResult | None = None
-    reason: Literal["invalid_evidence", "query_failed"] | None = None
+    reason: Literal["invalid_evidence", "query_failed", "result_limit"] | None = None
 
 
 @dataclass(frozen=True)
@@ -331,6 +336,8 @@ class DemoQueries:
             rows = self._execute_statement(statement, deadline=deadline)
         except _PlanDeadline:
             return DemoTaskOutcome(task_id, "deadline")
+        except DemoPreviewTooLarge:
+            outcome = DemoTaskOutcome(task_id, "failed", reason="result_limit")
         except SQLAlchemyError:
             outcome = DemoTaskOutcome(task_id, "failed", reason="query_failed")
         else:
@@ -352,8 +359,12 @@ class DemoQueries:
                     raise PermissionError("The requested column is unavailable in this dataset version.")
                 source = tasks[ref.source_task_id].request
                 output = statements[ref.source_task_id].selected_columns
-                limit = source.limit if isinstance(source, DemoPreview) else 1
-                if ref.source_column not in output or ref.row_index >= limit:
+                if isinstance(source, DemoPreview):
+                    allowed = source.columns or self._versions[source.version_id].columns
+                    has_evidence = ref.source_column in allowed and ref.row_index < source.limit
+                else:
+                    has_evidence = ref.source_column in output and ref.row_index == 0
+                if not has_evidence:
                     raise ValueError("The evidence reference is outside the predecessor output.")
                 source_type = _evidence_type(output[ref.source_column])
                 target_type = _evidence_type(version.relation.c[ref.column])
@@ -391,25 +402,37 @@ class DemoQueries:
                 raise PermissionError("The requested column is unavailable in this dataset version.")
             return approved[name]
 
-        if isinstance(request, DemoPreview):
-            order = [
-                column(item.column).desc() if item.descending else column(item.column).asc()
-                for item in request.sort
-            ]
-            statement = (
-                select(*(column(name) for name in dict.fromkeys(request.columns or version.columns)))
-                .order_by(*order, relation.c[version.row_key].asc())
-                .limit(request.limit)
-                .offset(request.offset)
-            )
-        else:
-            statement = select(func.count().label("row_count")).select_from(relation)
-
         predicates = [
             _COMPARISONS[item.comparison](column(item.column), item.value)
             for item in request.filters
         ]
-        return statement.where(*predicates)
+        if not isinstance(request, DemoPreview):
+            return select(func.count().label("row_count")).select_from(relation).where(*predicates)
+
+        projected = tuple(column(name) for name in dict.fromkeys(request.columns or version.columns))
+        sort_keys = [(column(item.column), item.descending) for item in request.sort]
+        sort_keys.append((relation.c[version.row_key], False))
+        bounded = (
+            select(*dict.fromkeys((*projected, *(key for key, _ in sort_keys))))
+            .where(*predicates)
+            .order_by(*(key.desc() if descending else key.asc() for key, descending in sort_keys))
+            .limit(request.limit).offset(request.offset).cte()
+        )
+        visible_columns = tuple(bounded.c[item.key] for item in projected)
+        payload = select(*visible_columns).subquery("preview_payload")
+        row_json = cast(func.row_to_json(literal_column("preview_payload.*")), Text)
+        row_bytes = func.octet_length(func.convert_to(row_json, "UTF8"))
+        # Include the array brackets and separators. SUM is NULL for an empty preview.
+        size = select((func.sum(row_bytes + 1) + 1).label("byte_count")).select_from(payload).subquery()
+        return (
+            select(*visible_columns, size.c.byte_count.label(None))
+            .select_from(size.outerjoin(bounded, size.c.byte_count <= DEMO_PREVIEW_MAX_BYTES))
+            .order_by(*(
+                bounded.c[key.key].desc() if descending else bounded.c[key.key].asc()
+                for key, descending in sort_keys
+            ))
+            .execution_options(demo_preview=True)
+        )
 
     def _execute_statement(self, statement: Select, *, deadline: float | None = None) -> list[dict]:
         with demo_read_transaction(self._engine) as connection:
@@ -423,7 +446,17 @@ class DemoQueries:
                     connection.execute(select(func.set_config("statement_timeout", str(remaining_ms), True)))
             try:
                 result = connection.execute(statement)
-                return [dict(row) for row in result.mappings()]
+                if not statement.get_execution_options().get("demo_preview"):
+                    return [dict(row) for row in result.mappings()]
+                # The size row remains visible when the join suppresses the entire preview.
+                rows = result.fetchall()
+                byte_count = rows[0][-1]
+                if byte_count is None:
+                    return []
+                if byte_count > DEMO_PREVIEW_MAX_BYTES:
+                    raise DemoPreviewTooLarge("This preview exceeds the result size limit.")
+                keys = tuple(result.keys())[:-1]
+                return [dict(zip(keys, row[:-1], strict=True)) for row in rows]
             except DBAPIError as exc:
                 if bounded_by_plan and getattr(exc.orig, "pgcode", None) == "57014":
                     raise _PlanDeadline from None

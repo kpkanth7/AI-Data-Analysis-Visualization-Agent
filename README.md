@@ -1,6 +1,6 @@
 # Data Analysis Agent
 
-The [hosted demo](https://ai-data-analysis-visualization-agent.streamlit.app/) requires Streamlit access. It offers Explorer and Chat previews and row counts for the three curated datasets. The full local app described below runs with `streamlit run legacy_app.py`.
+The [hosted demo](https://ai-data-analysis-visualization-agent.streamlit.app/) requires Streamlit access. It offers Explorer and Chat previews and row counts for the three curated datasets. Each preview has a 64 KiB result budget. The hosted entry point is `app.py` and installs the guarded dependencies from `requirements.txt`. The rest of this guide describes the local legacy app.
 
 A natural-language data analyst in your browser. Drop a CSV, ask a question in plain English, get back SQL, charts, and a clean answer. Full session history, structured PDF reports, and a multi-step cleaning wizard that handles the gross parts of real-world data for you.
 
@@ -137,7 +137,7 @@ What I haven't done: row-level encryption, formal audit logs, pen-test. This is 
 git clone <this-repo>
 cd "data analysis agent"
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-legacy.txt
 cp .env.example .env   # then fill in OPENAI_API_KEY and DATABASE_URL
 python -m scripts.setup_db  # creates tables, loads demo datasets
 streamlit run legacy_app.py
@@ -149,7 +149,7 @@ For owner access, add `owner_password = "yourpassword"` to `.streamlit/secrets.t
 
 ## Private workspace pilot
 
-Run the pilot from the repository root after provisioning its PostgreSQL registry and workspace roles. Use the commented settings in [the Streamlit secrets example](.streamlit/secrets.toml.example) for a default OIDC provider, its expected issuer, and the three scoped database URLs. Install the dependencies from `requirements.txt`, which pins Streamlit and Authlib for the pilot. The provider's allowed callback must match the configured `/oauth2callback` URL. [Streamlit authentication setup](https://docs.streamlit.io/develop/concepts/connections/authentication)
+Run the pilot from the repository root after provisioning its PostgreSQL registry and workspace roles. Use the commented settings in [the Streamlit secrets example](.streamlit/secrets.toml.example) for a default OIDC provider, its expected issuer, and the three scoped database URLs. Install the guarded dependencies with `python -m pip install --require-hashes -r requirements.txt` and run `streamlit run app.py`. This install serves the curated demo with the pilot flag disabled. The Linux integration workflow adds its test dependencies from `requirements-ci.txt`. The provider's allowed callback must match the configured `/oauth2callback` URL. [Streamlit authentication setup](https://docs.streamlit.io/develop/concepts/connections/authentication)
 
 ```bash
 python -m streamlit run private_pilot_app.py

@@ -11,7 +11,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import NullPool
 
 from db.demo_catalog import DEMO_READER, DEMO_WORKSPACE, load_demo_versions
-from db.demo_queries import DemoAccess, DemoCount, DemoPlan, DemoQueries, DemoTaskOutcome, demo_read_transaction
+from db.demo_queries import (
+    DEMO_PREVIEW_MAX_BYTES, DemoAccess, DemoCount, DemoPlan, DemoQueries, DemoTaskOutcome, demo_read_transaction,
+)
 from ui.demo_tabs import DemoQueryScope, DemoScopeChanged, demo_query_scope, render_demo_chat, render_demo_explorer
 from ui.service_status import render_service_unavailable
 
@@ -74,7 +76,10 @@ def main() -> None:
         </style>
     """)
     st.title("Data Analysis Agent Demo")
-    st.write("Browse read-only sample datasets in Explorer, or use Chat to count or preview rows.")
+    st.write(
+        "Browse read-only sample datasets in Explorer, or use Chat to count or preview rows. "
+        f"Each preview has a {DEMO_PREVIEW_MAX_BYTES // 1024} KiB size limit."
+    )
     st.caption("Curated samples cannot be deleted.")
     try:
         with _demo_queries() as queries:

@@ -15,9 +15,8 @@ from uuid import UUID, uuid4
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
-    Boolean, CheckConstraint, Column, Date, DateTime, Float, ForeignKey, Integer,
-    LargeBinary, MetaData, Numeric, Table, Text, delete, func, insert, inspect,
-    literal, or_, select, text, update,
+    Boolean, CheckConstraint, Column, Date, DateTime, ForeignKey, Integer,
+    LargeBinary, MetaData, Table, Text, delete, func, insert, inspect, literal, or_, select, text, update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
@@ -449,9 +448,16 @@ class WorkspaceDatasets:
             if isinstance(request, WorkspaceColumnSummary):
                 if request.column not in dataset.columns:
                     raise PermissionError("This dataset column is unavailable.")
-                columns = inspect(connection).get_columns(relation.name, schema=relation.schema)
-                column_type = next((column["type"] for column in columns if column["name"] == request.column), None)
-                if column_type is None:
+                numeric = connection.execute(text("""
+                    SELECT atttypid IN (
+                        'int2'::regtype, 'int4'::regtype, 'int8'::regtype,
+                        'float4'::regtype, 'float8'::regtype, 'numeric'::regtype
+                    )
+                    FROM pg_catalog.pg_attribute
+                    WHERE attrelid = pg_catalog.to_regclass(:relation)
+                      AND attname = :column AND attnum > 0 AND NOT attisdropped
+                """), {"relation": f"{relation.schema}.{relation.name}", "column": request.column}).scalar_one_or_none()
+                if numeric is None:
                     raise PermissionError("This dataset column is unavailable.")
                 source = select(relation.c[request.column].label("value")).limit(MAX_UPLOAD_ROWS + 1).subquery()
                 value = source.c.value
@@ -459,7 +465,7 @@ class WorkspaceDatasets:
                     func.count(value).label("non_null_count"),
                     (func.count() - func.count(value)).label("null_count"),
                 ])
-                if isinstance(column_type, (Float, Integer, Numeric)):
+                if numeric:
                     aggregates.extend([
                         func.min(value).label("minimum"), func.max(value).label("maximum"),
                         func.sum(value).label("total"), func.avg(value).label("mean"),

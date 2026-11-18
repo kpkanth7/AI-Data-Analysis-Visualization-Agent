@@ -1,0 +1,38 @@
+name: Guarded release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - name: Verify PostgreSQL tools
+        run: |
+          postgres_bin="$(pg_config --bindir)"
+          test -x "$postgres_bin/initdb"
+          test -x "$postgres_bin/pg_ctl"
+          printf '%s\n' "$postgres_bin" >> "$GITHUB_PATH"
+      - name: Install the guarded and test dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-ci.txt
+          python -m pip check
+          python -c 'from importlib.util import find_spec; assert find_spec("chromadb") is None'
+      - name: Run guarded application integration tests
+        run: >-
+          python -m pytest -q -rs
+          tests/test_demo_queries.py tests/test_workspace_datasets.py tests/test_workspace_pilot.py
+          -k 'not demo_cutover_and_rollback_preserve_legacy_data'
