@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from uuid import UUID
 
 import streamlit as st
 from sqlalchemy import create_engine
@@ -10,8 +11,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import NullPool
 
 from db.demo_catalog import DEMO_READER, DEMO_WORKSPACE, load_demo_versions
-from db.demo_queries import DemoAccess, DemoCount, DemoQueries, demo_read_transaction
-from ui.demo_tabs import render_demo_chat, render_demo_explorer
+from db.demo_queries import DemoAccess, DemoCount, DemoPlan, DemoQueries, DemoTaskOutcome, demo_read_transaction
+from ui.demo_tabs import DemoQueryScope, DemoScopeChanged, demo_query_scope, render_demo_chat, render_demo_explorer
 from ui.service_status import render_service_unavailable
 
 
@@ -31,15 +32,36 @@ def _demo_queries() -> Iterator[DemoQueries]:
         engine.dispose()
 
 
-def _execute_demo_question(request: DemoCount) -> list[dict]:
-    # A fragment rerun skips main(), so recheck the reader and catalog here.
-    with _demo_queries() as queries:
-        return queries.execute(request)
+@contextmanager
+def _fresh_chat_reader(rendered: DemoQueries, version_ids: set[UUID]) -> Iterator[DemoQueries]:
+    # A fragment rerun skips main(). Check the picker against the newly admitted catalog.
+    def scopes(reader: DemoQueries) -> dict[UUID, DemoQueryScope]:
+        return {
+            version.version_id: demo_query_scope(reader.access, version)
+            for version in reader.versions if version.version_id in version_ids
+        }
+
+    try:
+        with _demo_queries() as fresh:
+            current = scopes(fresh)
+            if current.keys() != version_ids or current != scopes(rendered):
+                raise PermissionError("The selected dataset scope changed.")
+            yield fresh
+    except PermissionError as exc:
+        raise DemoScopeChanged from exc
 
 
 @st.fragment
 def _render_chat(queries: DemoQueries) -> None:
-    render_demo_chat(queries, execute=_execute_demo_question)
+    def execute(request: DemoCount) -> list[dict]:
+        with _fresh_chat_reader(queries, {request.version_id}) as reader:
+            return reader.execute(request)
+
+    def run_plan(plan: DemoPlan) -> tuple[DemoTaskOutcome, ...]:
+        with _fresh_chat_reader(queries, {task.request.version_id for task in plan.tasks}) as reader:
+            return reader.run_plan(plan)
+
+    render_demo_chat(queries, execute=execute, run_plan=run_plan)
 
 
 def main() -> None:

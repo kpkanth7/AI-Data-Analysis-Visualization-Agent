@@ -2,20 +2,57 @@
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from html import escape
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import streamlit as st
 from pydantic import TypeAdapter
 from sqlalchemy.exc import SQLAlchemyError
 
 from core.csv_export import csv_bytes
-from db.demo_queries import DemoCount, DemoFilter, DemoPreview, DemoQueries, DemoSort, DemoVersion
+from db.demo_queries import (
+    DemoAccess, DemoCount, DemoCountTask, DemoFilter, DemoPlan, DemoPreview, DemoPreviewTask,
+    DemoQueries, DemoSort, DemoTaskOutcome, DemoTaskResult, DemoVersion,
+)
 from ui.csv_download import render_csv_link
 from ui.service_status import render_service_unavailable
 
 
 logger = logging.getLogger(__name__)
+
+_DEMO_QUERY_POLICY_VERSION = 1
+
+
+@dataclass(frozen=True)
+class DemoQueryScope:
+    access: DemoAccess
+    version_id: UUID
+    relation: str
+    row_key: str
+    columns: tuple[str, ...]
+    policy_version: int
+
+
+def demo_query_scope(access: DemoAccess, version: DemoVersion) -> DemoQueryScope:
+    return DemoQueryScope(
+        access, version.version_id, version.relation.fullname, version.row_key,
+        version.columns, _DEMO_QUERY_POLICY_VERSION,
+    )
+
+
+class DemoScopeChanged(PermissionError):
+    """The selected catalog or reader changed after rendering the dataset picker."""
+
+
+def _clear_chat_checkpoint() -> None:
+    for key in ("demo_chat_scope", "demo_chat_last_operation", "demo_chat_failed_request", "demo_chat_retry_requested"):
+        st.session_state.pop(key, None)
+
+
+def _show_changed_access() -> None:
+    _clear_chat_checkpoint()
+    st.info("Dataset access changed. Reload the page and ask a new question.")
 
 _DEMO_ROW_DESCRIPTIONS = {
     "titanic": "One row per passenger, with ticket, travel, and survival details.",
@@ -51,10 +88,12 @@ def _request_demo_chat_retry() -> None:
 
 def render_demo_chat(
     queries: DemoQueries, *, execute: Callable[[DemoCount], list[dict]] | None = None,
+    run_plan: Callable[[DemoPlan], tuple[DemoTaskOutcome, ...]] | None = None,
 ) -> None:
     st.header("Ask about the demo data")
     versions = {version.version_id: version for version in queries.versions}
     if not versions:
+        _clear_chat_checkpoint()
         st.info("No demo datasets are available.")
         return
     selected = st.selectbox(
@@ -62,23 +101,34 @@ def render_demo_chat(
         key="demo_chat_dataset",
     )
     if selected is None:
+        _clear_chat_checkpoint()
         return
     version = versions[selected]
+    if "demo_chat_conversation" not in st.session_state:
+        st.session_state["demo_chat_conversation"] = uuid4()
+    scope = (st.session_state["demo_chat_conversation"], demo_query_scope(queries.access, version))
+    if scope != st.session_state.get("demo_chat_scope"):
+        _clear_chat_checkpoint()
+        st.session_state["demo_chat_scope"] = scope
     _render_dataset_brief(version)
     label = version.label
     st.text(f"How many rows are in {label}?")
-    question = st.chat_input("Ask for a row count or preview", key="demo_chat_input")
+    question = st.chat_input("Ask for a row count, preview, or both", key="demo_chat_input")
     with st.container():
-        result = _run_demo_question(selected, label, question, execute or queries.execute)
-
-    announcement = ""
-    if result is not None:
-        request, rows = result
-        announcement = (
-            f"Showing {len(rows)} rows from {label}."
-            if isinstance(request, DemoPreview)
-            else f"{label} has {rows[0]['row_count']:,} rows."
+        outcomes = _run_demo_question(
+            version, queries.versions, question, execute or queries.execute, run_plan or queries.run_plan,
         )
+
+    messages = []
+    for outcome in outcomes:
+        result = outcome.result
+        if result is None:
+            messages.append(f"The {outcome.task_id} could not finish.")
+        elif isinstance(result.request, DemoPreview):
+            messages.append(f"Showing {len(result.rows)} rows from {label}.")
+        else:
+            messages.append(f"{label} has {result.rows[0]['row_count']:,} rows.")
+    announcement = " ".join(messages)
 
     # Keep the same live region mounted when idle, running, and complete.
     st.markdown(
@@ -87,17 +137,23 @@ def render_demo_chat(
         f"{escape(announcement)}</span>",
         unsafe_allow_html=True,
     )
-    if result is not None:
+    if outcomes:
         with st.chat_message("assistant"):
-            if isinstance(request, DemoPreview):
-                _render_preview(version, rows)
-            else:
-                st.write(announcement)
+            for outcome, message in zip(outcomes, messages):
+                if outcome.result is None:
+                    st.warning(message)
+                elif isinstance(outcome.result.request, DemoPreview):
+                    _render_preview(version, outcome.result.rows)
+                else:
+                    st.write(message)
 
 
 def _run_demo_question(
-    selected: UUID, label: str, question: str | None, execute: Callable[[DemoCount], list[dict]],
-) -> tuple[DemoCount, list[dict]] | None:
+    version: DemoVersion, versions: tuple[DemoVersion, ...], question: str | None,
+    execute: Callable[[DemoCount], list[dict]], run_plan: Callable[[DemoPlan], tuple[DemoTaskOutcome, ...]],
+) -> tuple[DemoTaskOutcome, ...]:
+    selected = version.version_id
+    label = version.label.casefold()
     retry_requested = st.session_state.pop("demo_chat_retry_requested", False)
     request = st.session_state.get("demo_chat_failed_request")
     if question or (request is not None and request.version_id != selected):
@@ -105,30 +161,64 @@ def _run_demo_question(
         request = None
 
     if question:
-        normalized = question.strip().rstrip("?.").casefold()
-        if normalized in {"row count", "how many rows", f"how many rows are in {label.casefold()}"}:
+        normalized = " ".join(question.casefold().split()).rstrip("?.").rstrip()
+        previous = st.session_state.pop("demo_chat_last_operation", None)
+        if normalized in {"again", "repeat"}:
+            if previous is None:
+                st.info(f"Ask a new question about {version.label}. You can request a row count, a preview, or both.")
+                return ()
+            normalized = previous
+        if normalized in {"count", "row count", "how many rows", f"how many rows are in {label}"}:
             request = DemoCount(version_id=selected)
-        elif normalized in {"preview", "show rows", f"preview {label.casefold()}"}:
+        elif normalized in {"preview", "show rows", f"preview {label}"}:
             request = DemoPreview(version_id=selected, limit=10)
+        elif normalized in {"both", "count and preview", f"count and preview {label}"}:
+            plan = DemoPlan(tasks=(
+                DemoCountTask(task_id="count", operation="count", request=DemoCount(version_id=selected)),
+                DemoPreviewTask(task_id="preview", operation="preview", request=DemoPreview(version_id=selected, limit=10)),
+            ))
+            try:
+                with st.spinner("Running demo question…"):
+                    outcomes = run_plan(plan)
+                if len(outcomes) == 2 and all(outcome.status == "success" for outcome in outcomes):
+                    st.session_state["demo_chat_last_operation"] = "both"
+                return outcomes
+            except DemoScopeChanged:
+                _show_changed_access()
+                return ()
+            except (KeyError, TypeError, ValueError, OSError, SQLAlchemyError) as exc:
+                logger.warning("Demo plan unavailable: %s", type(exc).__name__)
+                st.error("This question could not run. Please submit it again in a moment.")
+                return ()
         else:
-            st.info("Try the row-count question above or ask for a preview.")
-            return None
+            for other in versions:
+                name = other.label.casefold()
+                if normalized in {f"preview {name}", f"how many rows are in {name}", f"count and preview {name}"}:
+                    st.info(f"Choose {other.label} in the dataset picker, then ask again.")
+                    return ()
+            st.info(f"For {version.label}, would you like a row count, a preview, or both?")
+            return ()
     elif request is None:
-        return None
+        return ()
     elif not retry_requested:
         _show_demo_question_retry()
-        return None
+        return ()
 
     try:
         with st.spinner("Running demo question…"):
             rows = execute(request)
+    except DemoScopeChanged:
+        _show_changed_access()
+        return ()
     except (KeyError, TypeError, ValueError, OSError, SQLAlchemyError) as exc:
         logger.warning("Demo question unavailable: %s", type(exc).__name__)
         st.session_state["demo_chat_failed_request"] = request
         _show_demo_question_retry()
-        return None
+        return ()
     st.session_state.pop("demo_chat_failed_request", None)
-    return request, rows
+    task_id = "preview" if isinstance(request, DemoPreview) else "count"
+    st.session_state["demo_chat_last_operation"] = task_id
+    return (DemoTaskOutcome(task_id, "success", DemoTaskResult(task_id, request, rows)),)
 
 
 def render_demo_explorer(queries: DemoQueries) -> None:
