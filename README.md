@@ -1,10 +1,18 @@
 # Data Analysis Agent
 
-The [hosted demo](https://ai-data-analysis-visualization-agent.streamlit.app/) requires Streamlit access. It offers Explorer and Chat previews and row counts for the three curated datasets. Each preview has a 64 KiB result budget. The hosted entry point is `app.py` and installs the guarded dependencies from `requirements.txt`. The rest of this guide describes the local legacy app.
+The [hosted demo](https://ai-data-analysis-visualization-agent.streamlit.app/) requires Streamlit access. It offers Explorer and Chat previews and row counts for the three curated datasets. Each preview has a 64 KiB result budget. The hosted entry point is `app.py` and installs the guarded dependencies from `requirements.txt`. The local legacy app is described in the feature and setup sections.
 
 A natural-language data analyst in your browser. Drop a CSV, ask a question in plain English, get back SQL, charts, and a clean answer. Full session history, structured PDF reports, and a multi-step cleaning wizard that handles the gross parts of real-world data for you.
 
 I built this end to end as a portfolio project. Streamlit on the front, LangChain + GPT-4o doing the agent work, Postgres + Chroma underneath. Proper guest-vs-owner separation, rate limiting, and a guided cleaning flow that I haven't really seen baked into other open analytics tools.
+
+## Guarded app privacy and recovery
+
+The private curated demo runs counts and previews through typed PostgreSQL queries. The guarded demo and pilot send zero model requests. The local legacy app described below uses a hosted model when its provider is configured.
+
+The invite-only pilot is for synthetic data. Streamlit signs users in through the configured OpenID Connect provider, then the app checks workspace membership in PostgreSQL. Uploaded versions, saved results, upload receipts and checkpoints live in PostgreSQL. Deleting a version removes its table, catalog entry, saved results and checkpoints. The upload receipt continues to account for the request. Checkpoint access expires after 24 hours.
+
+When the pilot loses access to a selected dataset or its membership registry, its access check clears the open preview and download links. After the registry recovers, use **Retry connection** and select the dataset again. Previously downloaded CSVs remain with their recipients. Older backups can contain deleted data or revoked memberships, so keep restores isolated until those changes have been reapplied.
 
 ## What it does
 

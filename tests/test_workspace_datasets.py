@@ -2,6 +2,7 @@
 
 import csv
 import json
+import shutil
 import subprocess
 import sys
 from base64 import b64decode
@@ -11,6 +12,7 @@ from datetime import timedelta
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Barrier, Event
 from time import time
 from types import SimpleNamespace
@@ -21,7 +23,7 @@ import pytest
 import streamlit as st
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event, inspect
-from sqlalchemy.exc import DBAPIError, IntegrityError, ProgrammingError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 from streamlit.testing.v1 import AppTest
 
@@ -332,6 +334,73 @@ def test_failed_receipt_rolls_back_dataset_and_leaves_slot_for_retry(make_worksp
         service.upload_csv(payload, "over-limit.csv", uuid4())
 
 
+def test_raw_and_cleaned_versions_share_admission_through_accounting_outage(
+    make_workspace, workspace_database,
+):
+    service, access, _, schema, reader, writer = make_workspace("upload-manager")
+    other_access = replace(access, principal_id="cleaning-manager", session_id=uuid4())
+    cleaner = WorkspaceDatasets(other_access, lambda: other_access, reader, writer)
+    payload = b'label\n"  example  "\n'
+    existing = [
+        service.upload_csv(payload, "source.csv", uuid4())
+        for _ in range(WORKSPACE_UPLOADS_PER_DAY - 1)
+    ]
+    source = existing[0]
+    approved = cleaner.preview_cleaning(WorkspaceTrimWhitespace(version_id=source.version_id, column="label"))
+    upload_id, cleaning_id = uuid4(), uuid4()
+
+    def upload():
+        return service.upload_csv(payload, "new.csv", upload_id)
+
+    def publish():
+        return cleaner.publish_cleaning(approved, cleaning_id)
+
+    def receipt_count():
+        with workspace_database.connect() as connection:
+            return connection.exec_driver_sql(f"SELECT count(*) FROM {schema}.upload_receipts").scalar_one()
+
+    tables = set(inspect(workspace_database).get_table_names(schema=schema))
+    with workspace_database.begin() as connection:
+        connection.exec_driver_sql(f"REVOKE SELECT ON {schema}.upload_receipts FROM {schema}_writer")
+    try:
+        for submit in (upload, publish):
+            with pytest.raises(ProgrammingError) as denied:
+                submit()
+            assert denied.value.orig.pgcode == "42501"
+            assert f"{schema}.upload_receipts" in denied.value.statement
+        assert set(service.list_datasets()) == set(existing)
+        assert set(inspect(workspace_database).get_table_names(schema=schema)) == tables
+        assert receipt_count() == WORKSPACE_UPLOADS_PER_DAY - 1
+        assert service.preview(source.version_id) == [{"label": "  example  "}]
+        other_workspace, *_ = make_workspace("independent-manager")
+        assert other_workspace.upload_csv(payload, "other.csv", uuid4()).row_count == 1
+    finally:
+        with workspace_database.begin() as connection:
+            connection.exec_driver_sql(f"GRANT SELECT ON {schema}.upload_receipts TO {schema}_writer")
+
+    ready = Barrier(2)
+
+    def attempt(submit):
+        ready.wait(timeout=10)
+        try:
+            return submit()
+        except UploadLimitReached:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(attempt, (upload, publish)))
+    winning_version, = (version for version in outcomes if version is not None)
+    winning_index = outcomes.index(winning_version)
+    retry = (upload, publish)[winning_index]
+    denied_request = (publish, upload)[winning_index]
+    assert retry() == winning_version
+    assert receipt_count() == WORKSPACE_UPLOADS_PER_DAY
+    assert set(service.list_datasets()) == {*existing, winning_version}
+    with pytest.raises(UploadLimitReached):
+        denied_request()
+    assert len(set(inspect(workspace_database).get_table_names(schema=schema)) - tables) == 1
+
+
 def test_preview_csv_is_bounded_and_uses_current_access(make_workspace):
     service, access, state, *_ = make_workspace("alice")
     dataset = service.upload(
@@ -417,6 +486,29 @@ def test_catalog_search_matches_literal_metadata_in_the_current_workspace(make_w
     state.current = None
     with pytest.raises(PermissionError):
         alice.list_datasets("other")
+
+
+def test_preview_access_checks_all_projected_columns_without_returning_rows(make_workspace, workspace_database):
+    service, _, _, schema, reader, _ = make_workspace("preview-check")
+    version = service.upload(pd.DataFrame({"label": ["private"], "value": [12]}), "preview.csv")
+    relation = f"{schema}.v_{version.version_id.hex}"
+    row_counts = []
+
+    @event.listens_for(reader, "after_cursor_execute")
+    def record_result(connection, cursor, statement, parameters, context, executemany):
+        if f"FROM {relation}" in statement:
+            row_counts.append(cursor.rowcount)
+
+    service.check_preview_access(version.version_id)
+    assert row_counts == [0]
+    with workspace_database.begin() as connection:
+        connection.exec_driver_sql(f"REVOKE SELECT ON {relation} FROM {schema}_reader")
+        connection.exec_driver_sql(f"GRANT SELECT (label, {ROW_KEY}) ON {relation} TO {schema}_reader")
+
+    assert service.metadata(version.version_id) == version
+    with pytest.raises(ProgrammingError) as denied:
+        service.check_preview_access(version.version_id)
+    assert denied.value.orig.pgcode == "42501"
 
 
 def test_preview_treats_concurrent_deletion_as_unavailable(make_workspace):
@@ -852,6 +944,151 @@ def test_analysis_run_expiry_purge_and_version_deletion(analysis_run, workspace_
         run.service.resume_analysis_run(fresh.run_id, **run.scope)
     with workspace_database.connect() as connection:
         assert connection.exec_driver_sql(f"SELECT count(*) FROM {run.schema}.analysis_runs").scalar_one() == 0
+
+
+def test_workspace_backup_is_quarantined_until_deletion_and_revocation_are_replayed(
+    make_workspace, workspace_database, membership_reader, tmp_path,
+):
+    dump_tool, restore_tool = (shutil.which(name) for name in ("pg_dump", "pg_restore"))
+    if not dump_tool or not restore_tool:
+        pytest.skip("Local PostgreSQL pg_dump and pg_restore are required")
+
+    owner = workspace_database
+    _, access, _, schema, reader, writer = make_workspace("backup-drill")
+    manager = ("https://issuer.example", "backup-manager")
+    revoked = ("https://issuer.example", "backup-former-member")
+
+    def manager_service(registry_engine, read_engine, write_engine):
+        registry = MembershipRegistry(registry_engine)
+        session_id = uuid4()
+
+        def resolve():
+            membership = registry.lookup(*manager)
+            return WorkspaceAccess(
+                membership.principal_id, session_id, membership.workspace_id,
+                membership.can_manage, membership.revision,
+            ) if membership else None
+
+        binding = resolve()
+        assert binding is not None
+        return WorkspaceDatasets(binding, resolve, read_engine, write_engine)
+
+    with owner.begin() as connection:
+        grant_membership(connection, *manager, access.workspace_id, can_manage=True)
+        grant_membership(connection, *revoked, access.workspace_id, can_manage=False)
+        create_analysis_results(connection, access.workspace_id)
+        create_analysis_runs(connection, access.workspace_id)
+
+    service = manager_service(membership_reader, reader, writer)
+    deleted_upload_id = uuid4()
+    removed_bytes, removed_name = b"value\n91\n", "remove.csv"
+    removed = service.upload_csv(removed_bytes, removed_name, deleted_upload_id)
+    retained = service.upload_csv(b"value\n12\n30\n", "retain.csv", uuid4())
+    expected_csv = service.full_csv(retained.version_id).data
+    retained_summary = service.summarize(WorkspaceColumnSummary(version_id=retained.version_id, column="value"))
+    service.save_analysis(retained_summary)
+    removed_summary = service.summarize(WorkspaceColumnSummary(version_id=removed.version_id, column="value"))
+    service.save_analysis(removed_summary)
+
+    def start_run(version):
+        scope = {"version_id": version.version_id, "conversation_id": uuid4()}
+        run = service.start_analysis_run(
+            WorkspaceColumnSummary(version_id=version.version_id, column="value"),
+            conversation_id=scope["conversation_id"],
+        )
+        return scope, service.advance_analysis_run(run.run_id, attempt_id=uuid4(), **scope)
+
+    removed_scope, removed_run = start_run(removed)
+    retained_scope, retained_run = start_run(retained)
+    _, expired_run = start_run(retained)
+    with owner.begin() as connection:
+        connection.exec_driver_sql(
+            f"UPDATE {schema}.analysis_runs SET expires_at=clock_timestamp() WHERE run_id=%s",
+            (expired_run.run_id,),
+        )
+
+    target = f"restore_{access.workspace_id.hex}"
+    cli = ["--host", owner.url.query["host"], "--username", owner.url.username, "--no-password"]
+    with TemporaryDirectory(dir=tmp_path) as backup_folder:
+        archive = Path(backup_folder) / "workspace.dump"
+        archive.touch(mode=0o600)
+        subprocess.run(
+            [dump_tool, *cli, "--dbname", owner.url.database, "--format=custom",
+             "--schema", schema, "--schema", "workspace_auth", "--file", str(archive)],
+            check=True, capture_output=True, timeout=30,
+        )
+
+        service.delete(removed.version_id)
+        with owner.begin() as connection:
+            revoke_membership(connection, *revoked)
+            assert purge_expired_analysis_runs(connection, access.workspace_id) == 1
+        assert {version.version_id for version in service.list_datasets()} == {retained.version_id}
+        assert MembershipRegistry(membership_reader).lookup(*revoked) is None
+        for read_deleted in (
+            lambda: service.full_csv(removed.version_id),
+            lambda: service.restore_analysis(removed.version_id, removed_summary.result_id),
+            lambda: service.resume_analysis_run(removed_run.run_id, **removed_scope),
+        ):
+            with pytest.raises(PermissionError):
+                read_deleted()
+
+        with owner.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            connection.exec_driver_sql(f"CREATE DATABASE {target} ALLOW_CONNECTIONS false")
+        with owner.begin() as connection:
+            connection.exec_driver_sql(f"REVOKE CONNECT ON DATABASE {target} FROM PUBLIC")
+            connection.exec_driver_sql(f"ALTER DATABASE {target} ALLOW_CONNECTIONS true")
+        subprocess.run(
+            [restore_tool, *cli, "--dbname", target, "--exit-on-error", "--single-transaction", str(archive)],
+            check=True, capture_output=True, timeout=30,
+        )
+
+    engines = [create_engine(engine.url.set(database=target), poolclass=NullPool, hide_parameters=True)
+               for engine in (owner, membership_reader, reader, writer)]
+    recovered_owner, recovered_registry, recovered_reader, recovered_writer = engines
+    try:
+        for engine in engines[1:]:
+            with pytest.raises(OperationalError, match="permission denied for database"):
+                engine.connect()
+
+        with recovered_owner.begin() as connection:
+            removed_table = f"{schema}.v_{removed.version_id.hex}"
+            assert connection.exec_driver_sql(f"SELECT value FROM {removed_table}").scalar_one() == 91
+            assert connection.exec_driver_sql(
+                "SELECT active FROM workspace_auth.memberships WHERE issuer=%s AND subject=%s", revoked,
+            ).scalar_one() is True
+            assert connection.exec_driver_sql(f"SELECT count(*) FROM {schema}.analysis_results").scalar_one() == 2
+            assert connection.exec_driver_sql(f"SELECT count(*) FROM {schema}.analysis_runs").scalar_one() == 3
+
+            # Apply the known post-backup deletion and revocation before opening the restored database.
+            revoke_membership(connection, *revoked)
+            catalog = version_catalog(schema)
+            removed_entry = connection.execute(
+                catalog.delete().where(catalog.c.version_id == removed.version_id)
+            )
+            assert removed_entry.rowcount == 1
+            connection.exec_driver_sql(f"DROP TABLE {removed_table}")
+            assert purge_expired_analysis_runs(connection, access.workspace_id) == 1
+            assert connection.exec_driver_sql("SELECT to_regclass(%s)", (removed_table,)).scalar_one() is None
+            assert connection.exec_driver_sql(f"SELECT count(*) FROM {schema}.analysis_results").scalar_one() == 1
+            assert connection.exec_driver_sql(f"SELECT count(*) FROM {schema}.analysis_runs").scalar_one() == 1
+            assert connection.exec_driver_sql(f"SELECT count(*) FROM {schema}.upload_receipts").scalar_one() == 2
+            roles = (MEMBERSHIP_READER, f"{schema}_reader", f"{schema}_writer")
+            connection.exec_driver_sql(f"GRANT CONNECT ON DATABASE {target} TO {', '.join(roles)}")
+
+        assert MembershipRegistry(recovered_registry).lookup(*revoked) is None
+        recovered = manager_service(recovered_registry, recovered_reader, recovered_writer)
+        assert recovered.list_datasets() == (retained,)
+        assert recovered.full_csv(retained.version_id).data == expected_csv
+        saved = recovered.restore_analysis(retained.version_id, retained_summary.result_id)
+        assert saved.values == retained_summary.values and saved.result_id == retained_summary.result_id
+        resumed = recovered.resume_analysis_run(retained_run.run_id, **retained_scope)
+        assert resumed.calls_remaining == retained_run.calls_remaining == 3
+        assert resumed.results[0].values == {"row_count": 2}
+        with pytest.raises(UploadRequestConflict, match="upload was deleted"):
+            recovered.upload_csv(removed_bytes, removed_name, deleted_upload_id)
+    finally:
+        for engine in engines:
+            engine.dispose()
 
 
 def test_analysis_run_scheduled_purge_is_expiry_only_and_workspace_scoped(
@@ -1456,6 +1693,48 @@ def test_pilot_delete_discloses_and_removes_only_the_selected_versions_runs(mana
         assert str(connection.exec_driver_sql(
             f"SELECT run_id FROM {pilot.schema}.analysis_runs"
         ).scalar_one()) == other_code.split(".")[0]
+
+
+def test_loaded_pilot_clears_private_state_when_registry_is_unavailable(
+    manager_run_ui, workspace_database, caplog,
+):
+    pilot = manager_run_ui
+    with workspace_database.begin() as connection:
+        create_analysis_runs(connection, pilot.workspace_id)
+    app = pilot.open(pilot.dataset.version_id)
+    app.radio[0].set_value("Count and summarize column").run()
+    next(button for button in app.button if button.label == "Start analysis run").click().run()
+    next(button for button in app.button if button.label == "Delete dataset").click().run()
+    assert not app.exception
+    assert app.get("html") and app.get("code") and app.get("iframe")
+    assert any(button.label == "Confirm deletion" for button in app.button)
+
+    with workspace_database.begin() as connection:
+        connection.exec_driver_sql(f"REVOKE SELECT ON workspace_auth.memberships FROM {MEMBERSHIP_READER}")
+    try:
+        app.run()
+        assert not app.exception and not app.selectbox and not app.radio
+        assert not app.get("html") and not app.get("iframe") and not app.get("code")
+        assert not app.get("file_uploader")
+        assert {button.label for button in app.button} == {"Sign out", "Retry connection"}
+        assert [error.value for error in app.error] == [
+            "Datasets are temporarily unavailable. Please retry in a moment.",
+        ]
+        service_messages = [record.getMessage() for record in caplog.records if record.name == "ui.service_status"]
+        assert service_messages and set(service_messages) == {"Dataset service unavailable: ProgrammingError"}
+    finally:
+        with workspace_database.begin() as connection:
+            connection.exec_driver_sql(f"GRANT SELECT ON workspace_auth.memberships TO {MEMBERSHIP_READER}")
+
+    app.button(key="retry_private_membership").click().run()
+    assert not app.exception and not app.error
+    assert app.selectbox[0].value is None
+    assert not app.get("html") and not app.get("iframe") and not app.get("code")
+    assert all(button.label != "Confirm deletion" for button in app.button)
+    with workspace_database.connect() as connection:
+        assert connection.exec_driver_sql(
+            f"SELECT version_id, cardinality(attempt_ids) FROM {pilot.schema}.analysis_runs"
+        ).one() == (pilot.dataset.version_id, 1)
 
 
 def test_pending_delete_cannot_survive_membership_change(

@@ -82,7 +82,7 @@ def _watch_access(
             selection = st.session_state.get(selection_key)
             if selection is not None:
                 try:
-                    service.metadata(selection)
+                    service.check_preview_access(selection)
                 except PermissionError:
                     st.session_state.pop(selection_key, None)
                     st.rerun()

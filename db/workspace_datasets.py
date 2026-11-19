@@ -727,6 +727,10 @@ class WorkspaceDatasets:
         _, rows = self._read_rows(version_id, limit)
         return rows
 
+    def check_preview_access(self, version_id: UUID) -> None:
+        """Check the preview projection's permissions without fetching any rows."""
+        self._read_rows(version_id, limit=0)
+
     def preview_csv(self, version_id: UUID) -> WorkspaceCSV:
         """Resolve a fresh authorized preview and serialize it without a server file."""
         dataset, rows = self._read_rows(version_id, PREVIEW_ROWS + 1)
