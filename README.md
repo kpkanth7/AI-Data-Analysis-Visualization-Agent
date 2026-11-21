@@ -6,6 +6,21 @@ A natural-language data analyst in your browser. Drop a CSV, ask a question in p
 
 I built this end to end as a portfolio project. Streamlit on the front, LangChain + GPT-4o doing the agent work, Postgres + Chroma underneath. Proper guest-vs-owner separation, rate limiting, and a guided cleaning flow that I haven't really seen baked into other open analytics tools.
 
+## Try the curated demo
+
+1. Open the private Streamlit app and select `titanic` in **Explorer**. The unfiltered dataset has **891 rows**. Set **Filter column** to `PassengerId` and enter `891` in **Equals**. The preview shows one row.
+2. In **Chat**, select `titanic` and ask `count and preview`. The answer reports **891 rows** and shows a ten-row preview. **Save Preview CSV (10 rows)** downloads those rows in order, with passenger IDs 1 through 10.
+3. If the dataset service reports an outage, use **Retry connection**. If Chat offers **Retry question**, select it to resubmit that question.
+
+If you lack hosted access or the app is unavailable, run the sample checks from the released repository checkout. On Linux with Python 3.11 and PostgreSQL's `initdb` and `pg_ctl` on your PATH, run the following in a virtual environment.
+
+```bash
+python -m pip install --require-hashes -r requirements-ci.txt
+python -m pytest -q -rs tests/test_demo_queries.py -k 'chat_and_explorer_agree_on_demo_results or demo_chat_retries_only_on_request'
+```
+
+The checks seed a disposable local PostgreSQL cluster and verify the displayed counts, CSV preview sizes, and explicit Chat retry. They require no hosted credentials or model key. [Guarded release and test results](https://github.com/kpkanth7/AI-Data-Analysis-Visualization-Agent/actions/runs/44453799801)
+
 ## Guarded app privacy and recovery
 
 The private curated demo runs counts and previews through typed PostgreSQL queries. The guarded demo and pilot send zero model requests. The local legacy app described below uses a hosted model when its provider is configured.
